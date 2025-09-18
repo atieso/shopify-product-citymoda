@@ -1,6 +1,7 @@
 import os, sys, html, time, json, traceback, requests
 from dotenv import load_dotenv
 
+VERSION = "2025-09-19-v3"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -21,12 +22,33 @@ MAX_PRODUCTS         = int(os.getenv("MAX_PRODUCTS", "25"))       # quanti prodo
 SAFE_DOMAINS_HINTS   = ["cdn", "images", "media", "static", "assets", "content", "img"]  # euristica
 DEBUG                = os.getenv("DEBUG", "false").lower() == "true"
 
-# ========= VALIDAZIONI BASE =========
-if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ADMIN_TOKEN:
-    print("ERRORE: configura SHOPIFY_STORE_DOMAIN e SHOPIFY_ADMIN_TOKEN nelle variabili d'ambiente.")
-    # non usciamo con errore (cron deve restare verde), ma non potremo fare chiamate
-if not (BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX)):
-    print("ATTENZIONE: nessuna chiave immagini impostata. Procedo senza immagini.")
+# ========= UTILS =========
+def safe_get(d, *path, default=None):
+    cur = d or {}
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            return default
+    return cur if cur is not None else default
+
+def safe_strip(v):
+    try:
+        return str(v or "").strip()
+    except Exception:
+        return ""
+
+def product_id_from_gid(gid: str) -> int:
+    return int(str(gid).split("/")[-1])
+
+def first_barcode(variants):
+    edges = safe_get(variants, "edges", default=[]) or []
+    for edge in edges:
+        node = edge.get("node") or {}
+        bc = safe_strip(node.get("barcode"))
+        if bc:
+            return bc
+    return ""
 
 # ========= SHOPIFY HELPERS =========
 def shopify_graphql(query: str, variables=None):
@@ -68,7 +90,7 @@ def add_image(product_id_num: int, image_src: str, alt_text: str=""):
     payload = {"image": {"src": image_src, "alt": (alt_text or "")[:255]}}
     r = requests.post(url, json=payload, headers=h, timeout=30)
     r.raise_for_status()
-    return r.json().get("image", {}).get("id")
+    return safe_get(r.json(), "image", "id")
 
 def update_description(product_id_num: int, body_html: str):
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id_num}.json"
@@ -90,7 +112,7 @@ def create_product_metafield(product_id_num: int, namespace: str, key: str, valu
     }}
     r = requests.post(url, json=payload, headers=h, timeout=20)
     r.raise_for_status()
-    return r.json().get("metafield", {}).get("id")
+    return safe_get(r.json(), "metafield", "id")
 
 # ========= IMAGE SEARCH =========
 def bing_image_search(query: str):
@@ -128,7 +150,6 @@ def google_cse_image_search(query: str):
     try:
         r = requests.get(base, params=params, timeout=20)
         if r.status_code >= 400:
-            # stampa messaggio errore utile (quota, restrizioni, ecc.)
             try:
                 print(f"[Google CSE ERROR {r.status_code}] {r.json()}")
             except Exception:
@@ -142,17 +163,11 @@ def google_cse_image_search(query: str):
 
 def pick_best_image(urls):
     if not urls: return None
-    # euristica: preferisci CDN / asset server “puliti”
     urls_sorted = sorted(urls, key=lambda u: 0 if any(h in (u or "").lower() for h in SAFE_DOMAINS_HINTS) else 1)
     return urls_sorted[0]
 
 # ========= DESCRIPTION (solo se NON usi Magic) =========
 def gen_description(title: str, vendor: str, ptype: str, ean: str):
-    """
-    Se USE_SHOPIFY_MAGIC_ONLY=True, non verrà chiamata.
-    Se OPENAI_API_KEY è valorizzata, prova a generare via OpenAI Responses API.
-    Altrimenti usa un fallback semplice in HTML.
-    """
     prompt = f"""
 Scrivi una descrizione breve e pulita per un prodotto moda.
 Dati:
@@ -180,7 +195,6 @@ Output in HTML semplice (<p>, <ul><li>), senza claim esagerati.
         except Exception as e:
             print(f"[WARN] OpenAI non disponibile: {e}")
 
-    # fallback HTML semplice
     title_h = html.escape(title or "Prodotto moda")
     vendor_h = html.escape(vendor or "")
     ptype_h = html.escape(ptype or "Abbigliamento")
@@ -195,26 +209,13 @@ Output in HTML semplice (<p>, <ul><li>), senza claim esagerati.
     ]) + "</ul>"
     return base + bullets
 
-# ========= UTILS =========
-def product_id_from_gid(gid: str) -> int:
-    return int(gid.split("/")[-1])
-
-def first_barcode(variants):
-    for edge in (variants or {}).get("edges", []) or []:
-        bc = (edge.get("node") or {}).get("barcode") or ""
-        if str(bc).strip():
-            return str(bc).strip()
-    return ""
-
 # ========= MAIN =========
 def main():
+    print(f"[START] draft_fashion_autofill {VERSION}")
     if DEBUG:
-        print("[DEBUG] Avvio script")
-        print(f"[DEBUG] Store: {SHOPIFY_STORE_DOMAIN}")
-        print(f"[DEBUG] Use Magic only: {USE_SHOPIFY_MAGIC_ONLY}")
+        print(f"[DEBUG] Store={SHOPIFY_STORE_DOMAIN} | APIv={SHOPIFY_API_VERSION} | MagicOnly={USE_SHOPIFY_MAGIC_ONLY} | Max={MAX_PRODUCTS}")
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[DEBUG] Fonte immagini: {fonte}")
-        print(f"[DEBUG] Max products: {MAX_PRODUCTS}")
 
     processed = 0
     cursor = None
@@ -225,10 +226,11 @@ def main():
             print(f"[ERROR fetch_draft_products] {e}")
             break
 
-        edges = (data.get("products") or {}).get("edges", []) or []
-        page_info = (data.get("products") or {}).get("pageInfo", {}) or {}
+        products = safe_get(data, "products", default={})
+        edges = products.get("edges", []) or []
+        page_info = products.get("pageInfo", {}) or {}
         cursor = page_info.get("endCursor")
-        has_next = page_info.get("hasNextPage", False)
+        has_next = bool(page_info.get("hasNextPage"))
 
         if not edges:
             print("Nessun prodotto in Bozza trovato.")
@@ -241,18 +243,18 @@ def main():
             n = e.get("node") or {}
             try:
                 # --- stato contenuti (robusto a None) ---
-                img_edges = ((n.get("images") or {}).get("edges", []) or [])
+                img_edges = safe_get(n, "images", "edges", default=[]) or []
                 has_img   = len(img_edges) > 0
 
-                body_html = (n.get("bodyHtml") or "")
-                has_desc  = bool(str(body_html).strip())
+                body_html = safe_strip(n.get("bodyHtml"))
+                has_desc  = bool(body_html)
                 if has_img or has_desc:
                     continue
 
                 # --- campi principali ---
-                title = (n.get("title") or "").strip()
-                vendor = (n.get("vendor") or "").strip()
-                ptype  = (n.get("productType") or "").strip()
+                title = safe_strip(n.get("title"))
+                vendor = safe_strip(n.get("vendor"))
+                ptype  = safe_strip(n.get("productType"))
                 ean    = first_barcode(n.get("variants"))
 
                 if not title:
@@ -264,7 +266,6 @@ def main():
 
                 # --- DESCRIZIONE ---
                 if USE_SHOPIFY_MAGIC_ONLY:
-                    # Non generiamo testo; impostiamo un flag per l'Admin
                     try:
                         create_product_metafield(pid_num, "ai", "needs_description", "true")
                         print("  - Flag impostato: ai.needs_description=true (usa Shopify Magic dall’Admin)")
@@ -317,7 +318,6 @@ def main():
             except Exception as ex:
                 print(f"[ERROR prodotto] {ex}")
                 traceback.print_exc()
-                # continua col prossimo prodotto
                 continue
 
         if not has_next:
@@ -329,11 +329,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-        # Manteniamo il cron "verde" anche se ci sono stati errori su singoli prodotti
-        sys.exit(0)
+        sys.exit(0)  # cron resta verde
     except Exception as e:
         print("=== UNCAUGHT ERROR ===")
         print(repr(e))
         traceback.print_exc()
-        # Non falliamo il cronjob comunque
-        sys.exit(0)
+        sys.exit(0)  # cron resta verde anche su errori imprevisti
