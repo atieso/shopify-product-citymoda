@@ -1,7 +1,7 @@
 import os, sys, html, time, json, traceback, requests
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v3"
+VERSION = "2025-09-19-v4"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -99,33 +99,40 @@ def update_description(product_id_num: int, body_html: str):
     r.raise_for_status()
     return True
 
-def create_product_metafield(product_id_num: int, namespace: str, key: str, value: str, mtype: str="single_line_text_field"):
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/metafields.json"
-    h = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
-    payload = {"metafield": {
+def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value: str, mtype: str="single_line_text_field"):
+    """
+    Crea/aggiorna un metafield sul prodotto via GraphQL metafieldsSet (robusto, evita 422 REST).
+    product_gid: es. "gid://shopify/Product/1234567890"
+    """
+    mutation = """
+    mutation SetMF($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { id key namespace }
+        userErrors { field message code }
+      }
+    }
+    """
+    vars_ = {
+      "metafields": [{
+        "ownerId": product_gid,
         "namespace": namespace,
         "key": key,
-        "value": value,
         "type": mtype,
-        "owner_resource": "product",
-        "owner_id": product_id_num
-    }}
-    r = requests.post(url, json=payload, headers=h, timeout=20)
-    r.raise_for_status()
-    return safe_get(r.json(), "metafield", "id")
+        "value": value
+      }]
+    }
+    data = shopify_graphql(mutation, vars_)
+    errs = (data.get("metafieldsSet") or {}).get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"metafieldsSet errors: {errs}")
+    return True
 
 # ========= IMAGE SEARCH =========
 def bing_image_search(query: str):
     if not BING_IMAGE_KEY: return None
     url = "https://api.bing.microsoft.com/v7.0/images/search"
     h = {"Ocp-Apim-Subscription-Key": BING_IMAGE_KEY}
-    params = {
-        "q": query,
-        "safeSearch": "Moderate",
-        "count": 12,
-        "imageType": "Photo",
-        "license": "Any"
-    }
+    params = {"q": query, "safeSearch": "Moderate", "count": 12, "imageType": "Photo", "license": "Any"}
     try:
         r = requests.get(url, headers=h, params=params, timeout=20)
         r.raise_for_status()
@@ -252,7 +259,7 @@ def main():
                     continue
 
                 # --- campi principali ---
-                title = safe_strip(n.get("title"))
+                title  = safe_strip(n.get("title"))
                 vendor = safe_strip(n.get("vendor"))
                 ptype  = safe_strip(n.get("productType"))
                 ean    = first_barcode(n.get("variants"))
@@ -267,7 +274,7 @@ def main():
                 # --- DESCRIZIONE ---
                 if USE_SHOPIFY_MAGIC_ONLY:
                     try:
-                        create_product_metafield(pid_num, "ai", "needs_description", "true")
+                        set_product_metafield_gql(n["id"], "ai", "needs_description", "true")
                         print("  - Flag impostato: ai.needs_description=true (usa Shopify Magic dall’Admin)")
                     except Exception as ex:
                         print(f"  - ERRORE flag Magic: {ex}")
