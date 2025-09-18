@@ -1,7 +1,9 @@
-import os, sys, html, time, json, traceback, requests
+import os, sys, html, time, json, csv, traceback, requests
+from urllib.parse import urlparse
+from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v4"
+VERSION = "2025-09-19-v6"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -9,18 +11,26 @@ SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "city-tre-srl.myshopify
 SHOPIFY_API_VERSION  = os.getenv("SHOPIFY_API_VERSION", "2025-01")
 SHOPIFY_ADMIN_TOKEN  = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
 
-# Scegli UNA fonte immagini (Bing OPPURE Google CSE)
-BING_IMAGE_KEY       = os.getenv("BING_IMAGE_KEY", "")            # Azure Cognitive Services (facoltativo)
-GOOGLE_CSE_KEY       = os.getenv("GOOGLE_CSE_KEY", "")            # Google API Key (facoltativo)
-GOOGLE_CSE_CX        = os.getenv("GOOGLE_CSE_CX", "")             # Custom Search Engine ID (facoltativo)
+# Fonti immagini (usa Google e/o Bing; va bene anche solo una)
+BING_IMAGE_KEY       = os.getenv("BING_IMAGE_KEY", "")
+GOOGLE_CSE_KEY       = os.getenv("GOOGLE_CSE_KEY", "")
+GOOGLE_CSE_CX        = os.getenv("GOOGLE_CSE_CX", "")
 
-# Descrizioni (opzionali, se NON usi Shopify Magic)
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")            # lascia vuoto per non usare AI esterna
-USE_SHOPIFY_MAGIC_ONLY = os.getenv("USE_SHOPIFY_MAGIC_ONLY", "true").lower() == "true"
+# Descrizioni (se NON usi Shopify Magic)
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
+USE_SHOPIFY_MAGIC_ONLY = os.getenv("USE_SHOPIFY_MAGIC_ONLY", "false").lower() == "true"
 
-MAX_PRODUCTS         = int(os.getenv("MAX_PRODUCTS", "25"))       # quanti prodotti processare per run
-SAFE_DOMAINS_HINTS   = ["cdn", "images", "media", "static", "assets", "content", "img"]  # euristica
-DEBUG                = os.getenv("DEBUG", "false").lower() == "true"
+# Quante immagini caricare per prodotto (hard cap = 5)
+MAX_IMAGES_PER_PRODUCT = min(int(os.getenv("MAX_IMAGES_PER_PRODUCT", "5")), 5)
+MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
+
+# Preferenze selezione immagini
+SAFE_DOMAINS_HINTS   = ["cdn", "images", "media", "static", "assets", "content", "img", "cloudfront", "akamaized"]
+WHITE_BG_KEYWORDS    = ["white", "bianco", "packshot", "studio", "product", "plain"]
+# opzionale: priorità a domini brand (csv): es. "guess.com,guess.eu,calvinklein.it"
+BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST", "").split(",") if d.strip()]
+
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
 # ========= UTILS =========
 def safe_get(d, *path, default=None):
@@ -49,6 +59,34 @@ def first_barcode(variants):
         if bc:
             return bc
     return ""
+
+def domain(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def score_image_url(u, vendor=""):
+    """Heuristics: priorità a CDN/brand, packshot, white background hints; penalizza marketplace/social."""
+    u = u or ""
+    d = domain(u)
+    score = 0
+    # 1) brand whitelist
+    if any(wh in d for wh in BRAND_DOMAINS_WHITELIST if wh):
+        score -= 5
+    # 2) vendor nel dominio
+    if vendor and vendor.lower().replace(" ", "") in d.replace("-", "").replace(" ", ""):
+        score -= 3
+    # 3) CDN/hint puliti
+    if any(h in d for h in SAFE_DOMAINS_HINTS):
+        score -= 2
+    # 4) parole chiave da packshot/white bg
+    if any(k in u.lower() for k in WHITE_BG_KEYWORDS):
+        score -= 2
+    # 5) penalizza marketplace/social rumorosi
+    if any(bad in d for bad in ["ebay.", "aliexpress.", "pinterest.", "facebook.", "tumblr.", "wordpress.", "blogspot."]):
+        score += 3
+    return score
 
 # ========= SHOPIFY HELPERS =========
 def shopify_graphql(query: str, variables=None):
@@ -100,10 +138,7 @@ def update_description(product_id_num: int, body_html: str):
     return True
 
 def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value: str, mtype: str="single_line_text_field"):
-    """
-    Crea/aggiorna un metafield sul prodotto via GraphQL metafieldsSet (robusto, evita 422 REST).
-    product_gid: es. "gid://shopify/Product/1234567890"
-    """
+    """Crea/aggiorna un metafield sul prodotto via GraphQL metafieldsSet."""
     mutation = """
     mutation SetMF($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
@@ -132,7 +167,14 @@ def bing_image_search(query: str):
     if not BING_IMAGE_KEY: return None
     url = "https://api.bing.microsoft.com/v7.0/images/search"
     h = {"Ocp-Apim-Subscription-Key": BING_IMAGE_KEY}
-    params = {"q": query, "safeSearch": "Moderate", "count": 12, "imageType": "Photo", "license": "Any"}
+    params = {
+        "q": query,
+        "safeSearch": "Moderate",
+        "count": 30,
+        "imageType": "Photo",
+        "imageContent": "Product",
+        "license": "Any"
+    }
     try:
         r = requests.get(url, headers=h, params=params, timeout=20)
         r.raise_for_status()
@@ -152,7 +194,9 @@ def google_cse_image_search(query: str):
         "q": query,
         "searchType": "image",
         "num": 10,
-        "safe": "active"
+        "safe": "active",
+        "imgType": "photo",
+        "imgDominantColor": "white"  # privilegia sfondo bianco
     }
     try:
         r = requests.get(base, params=params, timeout=20)
@@ -168,23 +212,63 @@ def google_cse_image_search(query: str):
         print(f"[Google CSE EXCEPTION] {e}")
         return None
 
-def pick_best_image(urls):
-    if not urls: return None
-    urls_sorted = sorted(urls, key=lambda u: 0 if any(h in (u or "").lower() for h in SAFE_DOMAINS_HINTS) else 1)
-    return urls_sorted[0]
+def collect_candidate_images(queries, vendor=""):
+    """Raccoglie più URL, li ordina per qualità euristica e rimuove duplicati."""
+    urls = []
+    seen = set()
+    for q in queries:
+        ulist = None
+        # Google prima (se disponibile), poi Bing
+        if GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
+            ulist = google_cse_image_search(q)
+        if (not ulist) and BING_IMAGE_KEY:
+            ulist = bing_image_search(q)
+        if not ulist:
+            continue
+        for u in ulist:
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            urls.append(u)
 
-# ========= DESCRIPTION (solo se NON usi Magic) =========
-def gen_description(title: str, vendor: str, ptype: str, ean: str):
+    # Scoring & sort
+    urls.sort(key=lambda u: score_image_url(u, vendor))
+    return urls
+
+def pick_top_images(urls, vendor="", max_n=3):
+    """Seleziona fino a max_n immagini preferendo packshot/white e domini 'puliti'."""
+    if not urls:
+        return []
+    # già ordinate da collect_candidate_images
+    top = []
+    seen_domains = set()
+    for u in urls:
+        d = domain(u)
+        # evita 2 immagini dallo stesso dominio se possibile
+        if d in seen_domains and len(top) < max_n - 1:
+            continue
+        top.append(u)
+        seen_domains.add(d)
+        if len(top) >= max_n:
+            break
+    return top
+
+# ========= DESCRIPTION (paragrafo + bullet) =========
+def gen_description_html(title: str, vendor: str, ptype: str, ean: str) -> str:
+    """Ritorna HTML con <p> iniziale + <ul> di bullet."""
+    # Se hai OPENAI_API_KEY, prova un testo un po' più ricco
     prompt = f"""
-Scrivi una descrizione breve e pulita per un prodotto moda.
+Scrivi una descrizione per un prodotto moda.
 Dati:
 - Titolo: {title}
 - Brand: {vendor or "N/D"}
 - Categoria: {ptype or "Abbigliamento"}
 - EAN: {ean or "N/D"}
-Stile: professionale, italiano, max 120-150 parole.
-Chiudi con 3-5 bullet (materiali, vestibilità, cura, occasioni d’uso, fit).
-Output in HTML semplice (<p>, <ul><li>), senza claim esagerati.
+Formato:
+1) Un paragrafo iniziale in italiano (max 120-150 parole), tono professionale e chiaro.
+2) Un elenco puntato (3-5 punti) con dettagli pratici (materiali, vestibilità, cura, occasioni d'uso, fit).
+Output SOLO in HTML semplice usando <p> e <ul><li>.
+Niente claim esagerati o linguaggio promozionale eccessivo.
 """.strip()
 
     if OPENAI_API_KEY:
@@ -202,30 +286,37 @@ Output in HTML semplice (<p>, <ul><li>), senza claim esagerati.
         except Exception as e:
             print(f"[WARN] OpenAI non disponibile: {e}")
 
+    # Fallback semplice, garantendo paragrafo + bullet
     title_h = html.escape(title or "Prodotto moda")
     vendor_h = html.escape(vendor or "")
     ptype_h = html.escape(ptype or "Abbigliamento")
-    base = f"<p>{title_h}{(' di ' + vendor_h) if vendor_h else ''}: essenziale {ptype_h} per il guardaroba quotidiano. " \
-           f"Design curato e materiali selezionati per comfort e durata, adatto a molteplici occasioni.</p>"
-    bullets = "<ul>" + "".join([
-        "<li>Materiali di qualità</li>",
-        "<li>Vestibilità equilibrata</li>",
-        "<li>Dettagli curati</li>",
-        "<li>Facile da abbinare</li>",
-        "<li>Istruzioni di cura semplici</li>",
+    p = (
+        f"<p>{title_h}{(' di ' + vendor_h) if vendor_h else ''}: un capo {ptype_h.lower()} essenziale, "
+        f"pensato per un utilizzo quotidiano con attenzione a comfort e durata. "
+        f"Linee pulite e dettagli curati lo rendono facile da abbinare nelle diverse occasioni, "
+        f"dal lavoro al tempo libero.</p>"
+    )
+    ul = "<ul>" + "".join([
+        "<li>Materiali selezionati per comfort e resistenza</li>",
+        "<li>Vestibilità equilibrata, facile da indossare</li>",
+        "<li>Dettagli curati e finiture pulite</li>",
+        "<li>Indicazioni di cura semplici</li>",
+        "<li>Adatto a molteplici occasioni</li>",
     ]) + "</ul>"
-    return base + bullets
+    return p + ul
 
 # ========= MAIN =========
 def main():
     print(f"[START] draft_fashion_autofill {VERSION}")
     if DEBUG:
-        print(f"[DEBUG] Store={SHOPIFY_STORE_DOMAIN} | APIv={SHOPIFY_API_VERSION} | MagicOnly={USE_SHOPIFY_MAGIC_ONLY} | Max={MAX_PRODUCTS}")
+        print(f"[DEBUG] Store={SHOPIFY_STORE_DOMAIN} | APIv={SHOPIFY_API_VERSION} | MagicOnly={USE_SHOPIFY_MAGIC_ONLY} | MaxProducts={MAX_PRODUCTS} | MaxImages={MAX_IMAGES_PER_PRODUCT}")
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[DEBUG] Fonte immagini: {fonte}")
 
     processed = 0
     cursor = None
+    results = []  # per report CSV
+
     while processed < MAX_PRODUCTS:
         try:
             data = fetch_draft_products(limit=50, cursor=cursor)
@@ -248,11 +339,14 @@ def main():
                 break
 
             n = e.get("node") or {}
+            notes = []
+            desc_updated = False
+            uploaded = 0
+
             try:
                 # --- stato contenuti (robusto a None) ---
                 img_edges = safe_get(n, "images", "edges", default=[]) or []
                 has_img   = len(img_edges) > 0
-
                 body_html = safe_strip(n.get("bodyHtml"))
                 has_desc  = bool(body_html)
                 if has_img or has_desc:
@@ -263,31 +357,39 @@ def main():
                 vendor = safe_strip(n.get("vendor"))
                 ptype  = safe_strip(n.get("productType"))
                 ean    = first_barcode(n.get("variants"))
+                pid_num = product_id_from_gid(n["id"])
 
                 if not title:
-                    print("[SKIP] Prodotto senza titolo.")
+                    notes.append("skip: titolo mancante")
+                    results.append({
+                        "product_id": pid_num, "title": "", "vendor": vendor, "ean": ean,
+                        "images_uploaded": uploaded, "description_updated": desc_updated, "notes": "; ".join(notes)
+                    })
                     continue
 
                 print(f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'}")
-                pid_num = product_id_from_gid(n["id"])
 
                 # --- DESCRIZIONE ---
                 if USE_SHOPIFY_MAGIC_ONLY:
                     try:
-                        set_product_metafield_gql(n["id"], "ai", "needs_description", "true")
-                        print("  - Flag impostato: ai.needs_description=true (usa Shopify Magic dall’Admin)")
+                        set_product_metafield_gql(n["id"], "ai_flags", "needs_description", "true")
+                        notes.append("flag Magic impostato")
+                        print("  - Flag impostato: ai_flags.needs_description=true (usa Shopify Magic dall’Admin)")
                     except Exception as ex:
+                        notes.append(f"flag Magic errore: {ex}")
                         print(f"  - ERRORE flag Magic: {ex}")
                 else:
-                    desc_html = gen_description(title, vendor, ptype, ean)
                     try:
+                        desc_html = gen_description_html(title, vendor, ptype, ean)
                         update_description(pid_num, desc_html)
+                        desc_updated = True
                         print("  - Descrizione aggiornata ✅")
                     except Exception as ex:
+                        notes.append(f"descrizione errore: {ex}")
                         print(f"  - ERRORE descrizione: {ex}")
 
-                # --- IMMAGINE ---
-                img_url = None
+                # --- IMMAGINI (fino a MAX_IMAGES_PER_PRODUCT, cap 5) ---
+                img_urls = []
                 if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
                     base = " ".join([x for x in [vendor, title, "product"] if x]).strip()
                     queries = []
@@ -296,49 +398,42 @@ def main():
                     queries += [
                         base,
                         f"{vendor} {title}".strip(),
+                        f"{vendor} {title} packshot".strip(),
+                        f"{vendor} {title} white background".strip(),
                         f"{vendor} {title} lookbook".strip(),
                         f"{vendor} {title} site:{(vendor or '').lower()}.com".strip(),
                     ]
 
-                    urls = None
-                    for q in queries:
-                        if GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
-                            urls = google_cse_image_search(q)
-                        if (not urls) and BING_IMAGE_KEY:
-                            urls = bing_image_search(q)
-                        if urls:
-                            img_url = pick_best_image(urls)
-                            if img_url:
-                                break
+                    candidates = collect_candidate_images(queries, vendor=vendor)
+                    img_urls = pick_top_images(candidates, vendor=vendor, max_n=MAX_IMAGES_PER_PRODUCT)
 
-                if img_url:
-                    try:
-                        image_id = add_image(pid_num, img_url, alt_text=f"{vendor} {title}".strip())
-                        print(f"  - Immagine aggiunta id={image_id} ✅")
-                    except Exception as ex:
-                        print(f"  - ERRORE immagine: {ex}")
+                if img_urls:
+                    for u in img_urls:
+                        try:
+                            img_id = add_image(pid_num, u, alt_text=f"{vendor} {title}".strip())
+                            uploaded += 1
+                            print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
+                        except Exception as ex:
+                            notes.append(f"img errore: {ex}")
+                            print(f"  - ERRORE immagine: {ex}")
+                    if uploaded == 0:
+                        notes.append("nessuna immagine caricata (tutte fallite)")
+                        print("  - Nessuna immagine caricata (tutte fallite).")
                 else:
+                    notes.append("nessuna immagine trovata")
                     print("  - Nessuna immagine trovata per la query.")
 
                 processed += 1
-                time.sleep(0.8)  # rate limit “gentile”
+
             except Exception as ex:
+                notes.append(f"errore prodotto: {ex}")
                 print(f"[ERROR prodotto] {ex}")
                 traceback.print_exc()
-                continue
 
-        if not has_next:
-            break
-
-    print(f"Fatto. Prodotti processati: {processed}")
-
-# ========= ENTRYPOINT =========
-if __name__ == "__main__":
-    try:
-        main()
-        sys.exit(0)  # cron resta verde
-    except Exception as e:
-        print("=== UNCAUGHT ERROR ===")
-        print(repr(e))
-        traceback.print_exc()
-        sys.exit(0)  # cron resta verde anche su errori imprevisti
+            # append result row
+            results.append({
+                "product_id": pid_num if 'pid_num' in locals() else "",
+                "title": title if 'title' in locals() else "",
+                "vendor": vendor if 'vendor' in locals() else "",
+                "ean": ean if 'ean' in locals() else "",
+                "images_uploaded": uploaded,
