@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v7"
+VERSION = "2025-09-19-v7a"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -413,6 +413,7 @@ def main():
                 body_html = safe_strip(n.get("bodyHtml"))
                 has_desc  = bool(body_html)
                 if has_img or has_desc:
+                    processed += 1
                     continue
 
                 # --- campi principali ---
@@ -472,7 +473,6 @@ def main():
                     ]
 
                     candidates = collect_candidate_images(queries, vendor=vendor)
-                    # filtra & scegli fino a MAX_IMAGES_PER_PRODUCT (cap 5)
                     img_urls = filter_and_select_images(candidates, vendor=vendor, want_n=MAX_IMAGES_PER_PRODUCT)
 
                 if img_urls:
@@ -499,7 +499,7 @@ def main():
                 traceback.print_exc()
                 processed += 1
 
-            # append result row
+            # append result row (✔️ blocco chiuso correttamente)
             results.append({
                 "product_id": pid_num if 'pid_num' in locals() else "",
                 "title": title if 'title' in locals() else "",
