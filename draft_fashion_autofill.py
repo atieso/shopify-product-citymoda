@@ -4,7 +4,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-19-v7m"
+VERSION = "2025-09-19-v7n"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -38,12 +38,11 @@ STRICT_CODE_DESC_ONLY   = os.getenv("STRICT_CODE_DESC_ONLY","true").lower()=="tr
 CONTEXT_FETCH_MAX       = int(os.getenv("CONTEXT_FETCH_MAX","250000"))  # bytes
 
 SUPPLIER_CODE_OFFSET    = int(os.getenv("SUPPLIER_CODE_OFFSET", "6"))
-SUPPLIER_CODE_REGEX     = os.getenv("SUPPLIER_CODE_REGEX", "")  # opzionale, es. r"^[A-Z0-9]{6}(?P<code>.+)$"
+SUPPLIER_CODE_REGEX     = os.getenv("SUPPLIER_CODE_REGEX", "")  # opzionale
 
 DEBUG = os.getenv("DEBUG","false").lower()=="true"
 ADMIN_URL_TEMPLATE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/products/{{pid}}"
 
-# Filtri input
 ALLOWED_IDS  = [x.strip() for x in os.getenv("PRODUCT_IDS","").split(",") if x.strip()]
 ALLOWED_SKUS = [x.strip() for x in os.getenv("PRODUCT_SKUS","").split(",") if x.strip()]
 ALLOWED_EANS = [x.strip() for x in os.getenv("PRODUCT_EANS","").split(",") if x.strip()]
@@ -91,7 +90,6 @@ def supplier_code_from_sku(sku: str) -> str:
                 return m.group("code").strip()
         except Exception:
             pass
-    # default: taglia via le prime 6 lettere/caratteri
     if len(sku) > SUPPLIER_CODE_OFFSET:
         return sku[SUPPLIER_CODE_OFFSET:]
     return sku
@@ -113,19 +111,6 @@ def collect_all_skus(variants):
         if sku: out.append(sku)
     return out
 
-def variant_selected_options(variants):
-    edges=safe_get(variants,"edges",default=[]) or []
-    out={}
-    for e in edges:
-        n=e.get("node") or {}
-        for opt in (n.get("selectedOptions") or []):
-            name=safe_strip(opt.get("name")).lower()
-            val =safe_strip(opt.get("value"))
-            if not name or not val: continue
-            if name in ["color","colour","colore"]: out["color"]=val
-            if name in ["size","taglia","misura"]: out["size"]=val
-    return out
-
 # ========= Shopify API =========
 def shopify_graphql(q, vars_=None):
     url=f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
@@ -135,13 +120,6 @@ def shopify_graphql(q, vars_=None):
     j=r.json()
     if "errors" in j: raise RuntimeError(j["errors"])
     return j["data"]
-
-def shopify_rest_get(path, params=None):
-    url=f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}{path}"
-    h={"X-Shopify-Access-Token":SHOPIFY_ADMIN_TOKEN}
-    r=requests.get(url, headers=h, params=params or {}, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
 def add_image(product_id_num: int, image_src: str, alt_text: str=""):
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id_num}/images.json"
@@ -158,28 +136,57 @@ def update_description(product_id_num: int, body_html: str):
     r.raise_for_status()
     return True
 
-def fetch_products_by_variants_query(terms, kind="sku"):
+# ========= Ricerca robusta per varianti (SKU) =========
+def fetch_products_by_variants_query_terms(terms, kind="sku"):
+    """
+    Prova più sintassi di query per aumentare le chance di match su Shopify:
+    - product_status:draft AND sku:"TERM"
+    - sku:"TERM"
+    - sku:TERM
+    Raccoglie i Product (dedup per product.id).
+    """
     if not terms: return []
     out={}
-    q="""
+    q_tpl = """
     query($first:Int!, $query:String!){
       productVariants(first:$first, query:$query){
-        edges{ node{
-          id sku barcode selectedOptions{ name value }
-          product{
-            id title vendor productType handle status bodyHtml tags
-            images(first:1){ edges{ node{ id } } }
-            variants(first:30){ edges{ node{ id sku barcode title selectedOptions{ name value } } } }
+        edges{
+          node{
+            id sku barcode
+            product{
+              id title vendor productType handle status bodyHtml tags
+              images(first:1){ edges{ node{ id } } }
+              variants(first:30){ edges{ node{ id sku barcode title selectedOptions{ name value } } } }
+            }
           }
-        }}
+        }
       }
     }"""
+    tried = []
     for t in terms:
-        data=shopify_graphql(q,{"first":30,"query":f"{kind}:{t}"})
-        edges=safe_get(data,"productVariants","edges",default=[]) or []
-        for e in edges:
-            prod=safe_get(e,"node","product")
-            if prod: out[prod["id"]]={"node":prod}
+        candidates = [
+            f'product_status:draft AND {kind}:"{t}"',
+            f'{kind}:"{t}"',
+            f'{kind}:{t}',
+        ]
+        for query_s in candidates:
+            key=(t, query_s)
+            if key in tried: continue
+            tried.append(key)
+            try:
+                data=shopify_graphql(q_tpl, {"first": 30, "query": query_s})
+                edges = safe_get(data,"productVariants","edges",default=[]) or []
+                if DEBUG:
+                    print(f"[DEBUG] search '{query_s}' -> {len(edges)} variants")
+                for e in edges:
+                    prod=safe_get(e,"node","product")
+                    if prod: out[prod["id"]]={"node":prod}
+                # se abbiamo già trovato qualcosa per questo termine, non serve provare altre forme
+                if edges: break
+            except Exception as ex:
+                if DEBUG:
+                    print(f"[DEBUG] query error '{query_s}': {ex}")
+                continue
     return list(out.values())
 
 def fetch_products_by_product_ids(id_list):
@@ -194,11 +201,58 @@ def fetch_products_by_product_ids(id_list):
         }
       }
     }"""
-    gids=[gid_from_product_id(int(x)) for x in id_list]
+    gids=[f"gid://shopify/Product/{int(x)}" for x in id_list]
     nodes=shopify_graphql(q,{"ids":gids}).get("nodes") or []
     return [{"node":n} for n in nodes if n]
 
-# ========= Search helpers =========
+def fallback_scan_draft_products_and_filter(terms, limit_pages=5):
+    """
+    Fallback: scansiona i prodotti Draft e filtra localmente i variant con sku che matcha uno dei termini.
+    Utile se la ricerca productVariants non restituisce risultati.
+    """
+    if not terms: return []
+    terms_lc = [t.lower() for t in terms]
+    out={}
+    q = """
+    query($first:Int!, $after:String){
+      products(first:$first, after:$after, query:"status:draft"){
+        pageInfo{ hasNextPage endCursor }
+        edges{
+          node{
+            id title vendor productType handle status bodyHtml tags
+            images(first:1){ edges{ node{ id } } }
+            variants(first:50){
+              edges{ node{ id sku barcode title selectedOptions{ name value } } }
+            }
+          }
+        }
+      }
+    }"""
+    after=None
+    pages=0
+    while pages < limit_pages:
+        data = shopify_graphql(q, {"first": 50, "after": after})
+        edges = safe_get(data,"products","edges",default=[]) or []
+        for e in edges:
+            n = e.get("node") or {}
+            var_edges = safe_get(n,"variants","edges",default=[]) or []
+            hit=False
+            for ve in var_edges:
+                sku = safe_strip(safe_get(ve,"node","sku"))
+                if sku and sku.lower() in terms_lc:
+                    hit=True; break
+            if hit:
+                out[n["id"]] = {"node": n}
+        page = safe_get(data,"products","pageInfo")
+        if page and page.get("hasNextPage"):
+            after = page.get("endCursor"); pages += 1
+        else:
+            break
+    if DEBUG:
+        print(f"[DEBUG] fallback scan matched products: {len(out)} (pages scanned: {pages+1})")
+    return list(out.values())
+
+# ========= Search (immagini + pagine) =========
 def bing_image_search(qry,count=50,pages=2):
     if not BING_IMAGE_KEY: return []
     url="https://api.bing.microsoft.com/v7.0/images/search"
@@ -349,7 +403,7 @@ def _extract_product_structured(text):
     except Exception:
         return {}
 
-# ========= Candidate gather & filters =========
+# ========= Candidati immagini & filtri =========
 def collect_candidate_images(queries, vendor="", code=""):
     items=[]; seen=set()
     for q in queries:
@@ -453,7 +507,7 @@ def gen_description_from_sources(title, vendor, ptype, code):
     desc_html = build_unique_description_from_page(title, vendor, ptype, code, info)
     return desc_html, link
 
-# ========= MAIN =========
+# ========= Report =========
 def row(pid, title, vendor, code, uploaded, desc_updated, notes, context_url="", image_urls=""):
     return {
         "product_id": pid, "title": title, "vendor": vendor, "code": code,
@@ -479,36 +533,57 @@ def report_and_exit(results, scanned, processed, skipped):
         print(f"[REPORT ERROR] {e}")
     print(f"[SUMMARY] Scanned: {scanned} | Updated: {processed} | Skipped: {skipped}")
 
+# ========= MAIN =========
 def main():
     print(f"[START] draft_fashion_autofill {VERSION}")
     fonte="Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
-    if DEBUG:
-        print(f"[DEBUG] Fonte: {fonte} | STRICT_CODE_IMAGE_MATCH={STRICT_CODE_IMAGE_MATCH} | STRICT_CODE_DESC_ONLY={STRICT_CODE_DESC_ONLY} | SUPPLIER_CODE_OFFSET={SUPPLIER_CODE_OFFSET}" + (f" | SUPPLIER_CODE_REGEX={SUPPLIER_CODE_REGEX}" if SUPPLIER_CODE_REGEX else ""))
+    print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
+    print(f"[INFO] STRICT_CODE_IMAGE_MATCH={STRICT_CODE_IMAGE_MATCH} | STRICT_CODE_DESC_ONLY={STRICT_CODE_DESC_ONLY}")
+    print(f"[INFO] Filtrando per SKU: {', '.join(ALLOWED_SKUS) if ALLOWED_SKUS else '(none)'}")
+    print(f"[INFO] SUPPLIER_CODE_OFFSET={SUPPLIER_CODE_OFFSET}" + (f" | SUPPLIER_CODE_REGEX={SUPPLIER_CODE_REGEX}" if SUPPLIER_CODE_REGEX else ""))
 
     processed=scanned=skipped=0
     results=[]
 
-    # selezione prodotti (primariamente SKU)
-    edges=[]
-    if ALLOWED_SKUS: edges += fetch_products_by_variants_query(ALLOWED_SKUS, kind="sku")
-    if ALLOWED_EANS: edges += fetch_products_by_variants_query(ALLOWED_EANS, kind="barcode")
-    if ALLOWED_IDS:
-        as_ean=[x for x in ALLOWED_IDS if x.isdigit() and 8<=len(x)<=14]
-        pure_ids=[x for x in ALLOWED_IDS if not (x.isdigit() and 8<=len(x)<=14)]
-        if as_ean: edges += fetch_products_by_variants_query(as_ean, kind="barcode")
-        if pure_ids: edges += fetch_products_by_product_ids(pure_ids)
+    # --- prepara termini SKU: originali + supplier-code (senza prime 6) ---
+    input_skus = ALLOWED_SKUS[:]  # da .env
+    supplier_skus = []
+    for s in ALLOWED_SKUS:
+        sc = supplier_code_from_sku(s)
+        if sc and sc.lower() != s.lower():
+            supplier_skus.append(sc)
+    seen = set()
+    sku_terms=[]
+    for x in (input_skus + supplier_skus):
+        xl=x.lower()
+        if xl in seen: continue
+        seen.add(xl); sku_terms.append(x)
 
-    # dedup per product.id
+    if DEBUG and sku_terms:
+        print(f"[DEBUG] SKU terms for selection: {', '.join(sku_terms)}")
+
+    # 1) ricerca principale per varianti (sku)
+    edges = fetch_products_by_variants_query_terms(sku_terms, kind="sku")
+
+    # 2) opzionale: EAN veri (se impostati correttamente come numeri)
+    valid_eans = [x for x in ALLOWED_EANS if x.isdigit()]
+    if valid_eans:
+        edges += fetch_products_by_variants_query_terms(valid_eans, kind="barcode")
+
+    # 3) fallback: scan prodotti draft e filtra localmente
+    if not edges:
+        edges = fallback_scan_draft_products_and_filter(sku_terms, limit_pages=5)
+
+    # dedup
     uniq={}
     for e in edges:
         n=e.get("node"); 
         if n: uniq[n["id"]]=e
     edges=list(uniq.values())
-    if not edges:
-        print("[INFO] Nessun prodotto trovato (usa PRODUCT_SKUS nel .env).")
-        report_and_exit(results, scanned, processed, skipped); return
 
-    TARGET_SKUS = set(s.lower() for s in ALLOWED_SKUS)
+    if not edges:
+        print("[INFO] Nessun prodotto trovato (controlla che gli SKU siano realmente nei variant.sku delle bozze).")
+        report_and_exit(results, scanned, processed, skipped); return
 
     for e in edges:
         if (processed+skipped)>=MAX_PRODUCTS: break
@@ -527,14 +602,13 @@ def main():
             all_skus = collect_all_skus(variants)
             ean = first_barcode(variants)
 
-            # determinare il codice da usare online (supplier code da SKU)
+            # scegli il codice per la ricerca esterna (supplier code da uno SKU matchato)
             chosen_sku = ""
             for s in all_skus:
-                if s and s.lower() in TARGET_SKUS:
+                if s and (s.lower() in [t.lower() for t in sku_terms]):
                     chosen_sku = s; break
-            if not chosen_sku:  # fallback: primo SKU
+            if not chosen_sku:
                 chosen_sku = all_skus[0] if all_skus else ""
-
             supplier_code = supplier_code_from_sku(chosen_sku) if chosen_sku else ""
             code_for_search = supplier_code or chosen_sku or ean or ""
 
@@ -564,7 +638,7 @@ def main():
 
             print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code_msg}")
 
-            # --- DESCRIZIONE (supplier-code first)
+            # --- DESCRIZIONE
             if USE_SHOPIFY_MAGIC_ONLY:
                 try:
                     shopify_graphql("""
@@ -590,7 +664,7 @@ def main():
                         used_context_url = context_url
                         print(f"    • Fonte descrizione: {context_url}")
 
-            # --- IMMAGINI (supplier-code strict + white bg + dedup)
+            # --- IMMAGINI
             img_urls=[]
             if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
                 base=" ".join([x for x in [vendor,title,"product"] if x]).strip()
@@ -635,13 +709,6 @@ def main():
 if __name__ == "__main__":
     try:
         print(f"[INFO] Using store: {SHOPIFY_STORE_DOMAIN}")
-        fonte="Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
-        print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
-        print(f"[INFO] STRICT_CODE_IMAGE_MATCH={STRICT_CODE_IMAGE_MATCH} | STRICT_CODE_DESC_ONLY={STRICT_CODE_DESC_ONLY}")
-        if ALLOWED_SKUS: print(f"[INFO] Filtrando per SKU: {', '.join(ALLOWED_SKUS)}")
-        if ALLOWED_EANS: print(f"[INFO] Filtrando per EAN: {', '.join(ALLOWED_EANS)}")
-        if ALLOWED_IDS:  print(f"[INFO] Filtrando per IDs: {', '.join(ALLOWED_IDS)}")
-        print(f"[INFO] SUPPLIER_CODE_OFFSET={SUPPLIER_CODE_OFFSET}" + (f" | SUPPLIER_CODE_REGEX={SUPPLIER_CODE_REGEX}" if SUPPLIER_CODE_REGEX else ""))
         main(); sys.exit(0)
     except Exception as e:
         print("=== UNCAUGHT ERROR ==="); print(repr(e)); traceback.print_exc(); sys.exit(0)
