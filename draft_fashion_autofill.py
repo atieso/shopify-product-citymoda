@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v7c"
+VERSION = "2025-09-19-v7d"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -89,14 +89,6 @@ def score_image_url(u, vendor=""):
 def product_header(title, vendor, ean):
     return f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'}"
 
-def product_summary_line(desc_updated: bool, uploaded: int, extra_note: str = ""):
-    parts = []
-    parts.append("Descrizione aggiornata ✅" if desc_updated else "Descrizione non aggiornata")
-    parts.append(f"Immagini caricate: {uploaded} ✅" if uploaded > 0 else "Nessuna immagine trovata")
-    if extra_note:
-        parts.append(extra_note)
-    return " - " + " | ".join(parts)
-
 # ========= SHOPIFY HELPERS =========
 def shopify_graphql(query: str, variables=None):
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
@@ -171,12 +163,9 @@ def bing_image_search(query: str, count=50, pages=2):
     out = []
     for p in range(pages):
         params = {
-            "q": query,
-            "safeSearch": "Moderate",
-            "count": count,
-            "offset": p * count,
-            "imageType": "Photo",
-            "imageContent": "Product",
+            "q": query, "safeSearch": "Moderate",
+            "count": count, "offset": p * count,
+            "imageType": "Photo", "imageContent": "Product",
             "license": "Any"
         }
         try:
@@ -364,7 +353,7 @@ def main():
     cursor = None
     results = []        # per report CSV
 
-    while processed + skipped < MAX_PRODUCTS or True:
+    while True:
         try:
             data = fetch_draft_products(limit=50, cursor=cursor)
         except Exception as e:
@@ -419,4 +408,149 @@ def main():
                 # --- campi principali ---
                 title  = safe_strip(n.get("title"))
                 vendor = safe_strip(n.get("vendor"))
-                ptype  = safe_strip(n.get("productType
+                ptype  = safe_strip(n.get("productType"))
+                ean    = first_barcode(n.get("variants"))
+                if not title:
+                    skipped += 1
+                    print("[PROCESS] SKIP: titolo mancante")
+                    results.append({
+                        "product_id": product_id_from_gid(n["id"]),
+                        "title": "", "vendor": vendor, "ean": ean,
+                        "images_uploaded": 0, "description_updated": False,
+                        "notes": "skip: titolo mancante"
+                    })
+                    continue
+
+                pid_num = product_id_from_gid(n["id"])
+                print(product_header(title, vendor, ean))
+
+                # --- DESCRIZIONE ---
+                if USE_SHOPIFY_MAGIC_ONLY:
+                    try:
+                        set_product_metafield_gql(n["id"], "ai_flags", "needs_description", "true")
+                        notes.append("flag Magic impostato")
+                        print("  - Flag impostato: ai_flags.needs_description=true (usa Shopify Magic dall’Admin)")
+                    except Exception as ex:
+                        notes.append(f"flag Magic errore: {ex}")
+                        print(f"  - ERRORE flag Magic: {ex}")
+                else:
+                    try:
+                        desc_html = gen_description_html(title, vendor, ptype, ean)
+                        update_description(pid_num, desc_html)
+                        desc_updated = True
+                        print("  - Descrizione aggiornata ✅")
+                    except Exception as ex:
+                        notes.append(f"descrizione errore: {ex}")
+                        print(f"  - ERRORE descrizione: {ex}")
+
+                # --- IMMAGINI (fino a 5, white background) ---
+                img_urls = []
+                if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
+                    base = " ".join([x for x in [vendor, title, "product"] if x]).strip()
+                    queries = []
+                    if ean:
+                        queries += [
+                            f"{base} {ean}",
+                            f"{vendor} {title} {ean} packshot",
+                            f"{vendor} {title} {ean} white background",
+                        ]
+                    queries += [
+                        base,
+                        f"{vendor} {title}".strip(),
+                        f"{vendor} {title} packshot".strip(),
+                        f"{vendor} {title} white background".strip(),
+                        f"{vendor} {title} studio".strip(),
+                        f"{vendor} {title} site:{(vendor or '').lower()}.com".strip(),
+                    ]
+
+                    candidates = collect_candidate_images(queries, vendor=vendor)
+                    img_urls = filter_and_select_images(candidates, vendor=vendor, want_n=MAX_IMAGES_PER_PRODUCT)
+
+                if img_urls:
+                    for u in img_urls:
+                        try:
+                            img_id = add_image(pid_num, u, alt_text=f"{vendor} {title}".strip())
+                            uploaded += 1
+                            print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
+                        except Exception as ex:
+                            notes.append(f"img errore: {ex}")
+                            print(f"  - ERRORE immagine: {ex}")
+                else:
+                    print("  - Nessuna immagine trovata per la query.")
+
+                # --- riepilogo per-prodotto nello stile richiesto ---
+                if uploaded > 0:
+                    print(f"  - Immagini caricate: {uploaded} ✅")
+                else:
+                    print("  - Nessuna immagine trovata per la query.")
+                if desc_updated or uploaded > 0:
+                    print(f"  Admin: {ADMIN_URL_TEMPLATE.format(pid=pid_num)}")
+
+                # --- contatori & risultati ---
+                if desc_updated or uploaded > 0:
+                    processed += 1
+                else:
+                    skipped += 1
+
+                results.append({
+                    "product_id": pid_num,
+                    "title": title,
+                    "vendor": vendor,
+                    "ean": ean,
+                    "images_uploaded": uploaded,
+                    "description_updated": desc_updated,
+                    "notes": "; ".join(notes)
+                })
+
+            except Exception as ex:
+                skipped += 1
+                notes.append(f"errore prodotto: {ex}")
+                print(f"[ERROR prodotto] {ex}")
+                traceback.print_exc()
+                results.append({
+                    "product_id": product_id_from_gid(n["id"]) if n.get("id") else "",
+                    "title": safe_strip(n.get("title")),
+                    "vendor": safe_strip(n.get("vendor")),
+                    "ean": first_barcode(n.get("variants")),
+                    "images_uploaded": 0,
+                    "description_updated": False,
+                    "notes": "; ".join(notes)
+                })
+
+        if (processed + skipped) >= MAX_PRODUCTS or not has_next:
+            break
+
+    # --- REPORT CSV ---
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = f"report_autofill_{ts}.csv"
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["product_id","title","vendor","ean","images_uploaded","description_updated","notes"])
+            w.writeheader()
+            for row in results:
+                w.writerow(row)
+        print(f"[REPORT] Salvato: {csv_path}")
+        print("[REPORT HEAD]")
+        with open(csv_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                print(line.rstrip())
+                if i >= 10:
+                    break
+    except Exception as e:
+        print(f"[REPORT ERROR] {e}")
+
+    print(f"[SUMMARY] Scanned: {scanned} | Updated: {processed} | Skipped: {skipped}")
+
+# ========= ENTRYPOINT =========
+if __name__ == "__main__":
+    try:
+        print(f"[INFO] Using store: {SHOPIFY_STORE_DOMAIN}")
+        fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
+        print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
+        main()
+        sys.exit(0)
+    except Exception as e:
+        print("=== UNCAUGHT ERROR ===")
+        print(repr(e))
+        traceback.print_exc()
+        sys.exit(0)
