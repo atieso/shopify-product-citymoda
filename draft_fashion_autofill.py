@@ -4,7 +4,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-19-v7n"
+VERSION = "2025-09-19-v7n-skur"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -94,6 +94,48 @@ def supplier_code_from_sku(sku: str) -> str:
         return sku[SUPPLIER_CODE_OFFSET:]
     return sku
 
+def sku_root(s: str) -> str:
+    """Restituisce la radice prima di _ o - (es. ABC123_S -> ABC123)."""
+    s = safe_strip(s)
+    if not s:
+        return ""
+    for sep in ["_", "-"]:
+        if sep in s:
+            return s.split(sep, 1)[0]
+    return s
+
+def expand_sku_terms_for_selection(input_skus):
+    """
+    Da una lista di SKU utente produce termini per la selezione:
+    - SKU originale
+    - supplier code (tagliato)
+    - radice(SKU)
+    - radice(supplier code)
+    Deduplicati e in ordine.
+    """
+    seen = set()
+    out = []
+    for s in input_skus:
+        s = safe_strip(s)
+        if not s:
+            continue
+        cand = [s]
+        sc = supplier_code_from_sku(s)
+        if sc and sc.lower() != s.lower():
+            cand.append(sc)
+        # radici senza taglia
+        for x in list(cand):
+            r = sku_root(x)
+            if r and r.lower() not in [y.lower() for y in cand]:
+                cand.append(r)
+        for c in cand:
+            cl = c.lower()
+            if cl in seen: 
+                continue
+            seen.add(cl)
+            out.append(c)
+    return out
+
 def first_barcode(variants):
     edges = safe_get(variants,"edges",default=[]) or []
     for e in edges:
@@ -139,7 +181,7 @@ def update_description(product_id_num: int, body_html: str):
 # ========= Ricerca robusta per varianti (SKU) =========
 def fetch_products_by_variants_query_terms(terms, kind="sku"):
     """
-    Prova più sintassi di query per aumentare le chance di match su Shopify:
+    Prova più sintassi di query:
     - product_status:draft AND sku:"TERM"
     - sku:"TERM"
     - sku:TERM
@@ -181,7 +223,6 @@ def fetch_products_by_variants_query_terms(terms, kind="sku"):
                 for e in edges:
                     prod=safe_get(e,"node","product")
                     if prod: out[prod["id"]]={"node":prod}
-                # se abbiamo già trovato qualcosa per questo termine, non serve provare altre forme
                 if edges: break
             except Exception as ex:
                 if DEBUG:
@@ -207,11 +248,19 @@ def fetch_products_by_product_ids(id_list):
 
 def fallback_scan_draft_products_and_filter(terms, limit_pages=5):
     """
-    Fallback: scansiona i prodotti Draft e filtra localmente i variant con sku che matcha uno dei termini.
-    Utile se la ricerca productVariants non restituisce risultati.
+    Fallback: scansiona i prodotti Draft e filtra localmente i variant con sku che:
+    - è uguale a un termine,
+    - inizia con un termine,
+    - ha radice (prima di _ o -) uguale a un termine.
     """
-    if not terms: return []
-    terms_lc = [t.lower() for t in terms]
+    if not terms:
+        return []
+    # normalizza termini (lower + radici)
+    terms_all = set(t.lower() for t in terms)
+    for t in list(terms_all):
+        rt = sku_root(t).lower()
+        terms_all.add(rt)
+
     out={}
     q = """
     query($first:Int!, $after:String){
@@ -238,9 +287,17 @@ def fallback_scan_draft_products_and_filter(terms, limit_pages=5):
             var_edges = safe_get(n,"variants","edges",default=[]) or []
             hit=False
             for ve in var_edges:
-                sku = safe_strip(safe_get(ve,"node","sku"))
-                if sku and sku.lower() in terms_lc:
-                    hit=True; break
+                sku_val = safe_strip(safe_get(ve,"node","sku"))
+                if not sku_val:
+                    continue
+                sv = sku_val.lower()
+                sv_root = sku_root(sv).lower()
+                for t in terms_all:
+                    if sv == t or sv.startswith(t) or sv_root == t:
+                        hit=True
+                        break
+                if hit:
+                    break
             if hit:
                 out[n["id"]] = {"node": n}
         page = safe_get(data,"products","pageInfo")
@@ -391,7 +448,6 @@ def _extract_product_structured(text):
             "color":  prod.get("color"),
             "material": prod.get("material"),
         }
-        # hint specs
         specs = {}
         for th in soup.find_all(["th","td"]):
             t = (th.get_text(" ", strip=True) or "").lower()
@@ -545,22 +601,10 @@ def main():
     processed=scanned=skipped=0
     results=[]
 
-    # --- prepara termini SKU: originali + supplier-code (senza prime 6) ---
-    input_skus = ALLOWED_SKUS[:]  # da .env
-    supplier_skus = []
-    for s in ALLOWED_SKUS:
-        sc = supplier_code_from_sku(s)
-        if sc and sc.lower() != s.lower():
-            supplier_skus.append(sc)
-    seen = set()
-    sku_terms=[]
-    for x in (input_skus + supplier_skus):
-        xl=x.lower()
-        if xl in seen: continue
-        seen.add(xl); sku_terms.append(x)
-
+    # --- prepara termini SKU: originali + supplier-code + radici (senza taglia) ---
+    sku_terms = expand_sku_terms_for_selection(ALLOWED_SKUS)
     if DEBUG and sku_terms:
-        print(f"[DEBUG] SKU terms for selection: {', '.join(sku_terms)}")
+        print(f"[DEBUG] SKU terms for selection (expanded): {', '.join(sku_terms)}")
 
     # 1) ricerca principale per varianti (sku)
     edges = fetch_products_by_variants_query_terms(sku_terms, kind="sku")
@@ -599,22 +643,29 @@ def main():
             ptype=safe_strip(n.get("productType"))
             status=safe_strip(n.get("status"))
             variants=n.get("variants")
-            all_skus = collect_all_skus(variants)
-            ean = first_barcode(variants)
 
-            # scegli il codice per la ricerca esterna (supplier code da uno SKU matchato)
+            # scegli il codice per la ricerca esterna: preferisci uno SKU variante che matcha i termini
             chosen_sku = ""
-            for s in all_skus:
-                if s and (s.lower() in [t.lower() for t in sku_terms]):
-                    chosen_sku = s; break
+            for ve in (safe_get(n,"variants","edges",default=[]) or []):
+                s = safe_strip(safe_get(ve,"node","sku"))
+                if not s:
+                    continue
+                sl = s.lower()
+                if any(sl == t.lower() or sl.startswith(t.lower()) or sku_root(sl) == t.lower() for t in sku_terms):
+                    chosen_sku = s
+                    break
             if not chosen_sku:
-                chosen_sku = all_skus[0] if all_skus else ""
+                v_edges = safe_get(n,"variants","edges",default=[]) or []
+                if v_edges:
+                    chosen_sku = safe_strip(safe_get(v_edges[0],"node","sku"))
+
             supplier_code = supplier_code_from_sku(chosen_sku) if chosen_sku else ""
-            code_for_search = supplier_code or chosen_sku or ean or ""
+            supplier_root = sku_root(supplier_code) if supplier_code else ""
+            code_for_search = supplier_root or supplier_code or sku_root(chosen_sku) or chosen_sku or first_barcode(n.get("variants")) or ""
 
             code_msg = code_for_search
             if supplier_code and chosen_sku and supplier_code != chosen_sku:
-                code_msg = f"{supplier_code} (from SKU {chosen_sku})"
+                code_msg = f"{code_for_search} (from SKU {chosen_sku})"
 
             if status and status.lower()!="draft":
                 skipped+=1
