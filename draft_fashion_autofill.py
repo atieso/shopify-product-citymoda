@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v7a"
+VERSION = "2025-09-19-v7c"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -38,6 +38,7 @@ DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "7"))
 MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES", "3500000"))  # ~3.5MB
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+ADMIN_URL_TEMPLATE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/products/{{pid}}"
 
 # ========= UTILS =========
 def safe_get(d, *path, default=None):
@@ -78,22 +79,23 @@ def score_image_url(u, vendor=""):
     u = u or ""
     d = domain(u)
     score = 0
-    # 1) brand whitelist
-    if any(wh in d for wh in BRAND_DOMAINS_WHITELIST if wh):
-        score -= 5
-    # 2) vendor nel dominio
-    if vendor and vendor.lower().replace(" ", "") in d.replace("-", "").replace(" ", ""):
-        score -= 3
-    # 3) CDN/hint puliti
-    if any(h in d for h in SAFE_DOMAINS_HINTS):
-        score -= 2
-    # 4) parole chiave da packshot/white bg
-    if any(k in u.lower() for k in WHITE_BG_KEYWORDS):
-        score -= 2
-    # 5) penalizza marketplace/social rumorosi
-    if any(bad in d for bad in ["ebay.", "aliexpress.", "pinterest.", "facebook.", "tumblr.", "wordpress.", "blogspot."]):
-        score += 3
+    if any(wh in d for wh in BRAND_DOMAINS_WHITELIST if wh): score -= 5
+    if vendor and vendor.lower().replace(" ", "") in d.replace("-", "").replace(" ", ""): score -= 3
+    if any(h in d for h in SAFE_DOMAINS_HINTS): score -= 2
+    if any(k in u.lower() for k in WHITE_BG_KEYWORDS): score -= 2
+    if any(bad in d for bad in ["ebay.", "aliexpress.", "pinterest.", "facebook.", "tumblr.", "wordpress.", "blogspot."]): score += 3
     return score
+
+def product_header(title, vendor, ean):
+    return f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'}"
+
+def product_summary_line(desc_updated: bool, uploaded: int, extra_note: str = ""):
+    parts = []
+    parts.append("Descrizione aggiornata ✅" if desc_updated else "Descrizione non aggiornata")
+    parts.append(f"Immagini caricate: {uploaded} ✅" if uploaded > 0 else "Nessuna immagine trovata")
+    if extra_note:
+        parts.append(extra_note)
+    return " - " + " | ".join(parts)
 
 # ========= SHOPIFY HELPERS =========
 def shopify_graphql(query: str, variables=None):
@@ -154,15 +156,7 @@ def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value:
       }
     }
     """
-    vars_ = {
-      "metafields": [{
-        "ownerId": product_gid,
-        "namespace": namespace,
-        "key": key,
-        "type": mtype,
-        "value": value
-      }]
-    }
+    vars_ = {"metafields": [{"ownerId": product_gid, "namespace": namespace, "key": key, "type": mtype, "value": value}]}
     data = shopify_graphql(mutation, vars_)
     errs = (data.get("metafieldsSet") or {}).get("userErrors") or []
     if errs:
@@ -196,22 +190,15 @@ def bing_image_search(query: str, count=50, pages=2):
     return out
 
 def google_cse_image_search(query: str, per_page=10, pages=3):
-    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
-        return []
+    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX): return []
     base = "https://www.googleapis.com/customsearch/v1"
     out = []
     for i in range(pages):
         start = 1 + i * per_page
         params = {
-            "key": GOOGLE_CSE_KEY,
-            "cx": GOOGLE_CSE_CX,
-            "q": query,
-            "searchType": "image",
-            "num": per_page,
-            "start": start,
-            "safe": "active",
-            "imgType": "photo",
-            "imgDominantColor": "white"
+            "key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": query,
+            "searchType": "image", "num": per_page, "start": start,
+            "safe": "active", "imgType": "photo", "imgDominantColor": "white"
         }
         try:
             r = requests.get(base, params=params, timeout=20)
@@ -287,8 +274,7 @@ def collect_candidate_images(queries, vendor=""):
         g = google_cse_image_search(q, per_page=10, pages=3) if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else []
         b = bing_image_search(q, count=50, pages=2) if BING_IMAGE_KEY else []
         for u in (g + b):
-            if not u or u in seen:
-                continue
+            if not u or u in seen: continue
             seen.add(u)
             urls.append(u)
     urls.sort(key=lambda u: score_image_url(u, vendor))
@@ -298,20 +284,16 @@ def filter_and_select_images(candidates, vendor="", want_n=5):
     selected = []
     seen_hashes = set()
     for url in candidates:
-        if len(selected) >= want_n:
-            break
+        if len(selected) >= want_n: break
         data = _download_bytes(url)
-        if not data:
-            continue
+        if not data: continue
         try:
             from PIL import Image
             from io import BytesIO
             img = Image.open(BytesIO(data))
-            if not _is_white_bg(img):
-                continue
+            if not _is_white_bg(img): continue
             h = _ahash(img)
-            if h in seen_hashes:
-                continue
+            if h in seen_hashes: continue
             seen_hashes.add(h)
             selected.append(url)
         except Exception:
@@ -376,11 +358,13 @@ def main():
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[DEBUG] Fonte immagini: {fonte}")
 
-    processed = 0
+    processed = 0       # prodotti aggiornati (desc e/o img)
+    scanned = 0         # prodotti visti (in bozza)
+    skipped = 0         # saltati (avevano già contenuti / problemi)
     cursor = None
-    results = []  # per report CSV
+    results = []        # per report CSV
 
-    while processed < MAX_PRODUCTS:
+    while processed + skipped < MAX_PRODUCTS or True:
         try:
             data = fetch_draft_products(limit=50, cursor=cursor)
         except Exception as e:
@@ -394,14 +378,16 @@ def main():
         has_next = bool(page_info.get("hasNextPage"))
 
         if not edges:
-            print("Nessun prodotto in Bozza trovato.")
+            if scanned == 0:
+                print("Nessun prodotto in Bozza trovato.")
             break
 
         for e in edges:
-            if processed >= MAX_PRODUCTS:
+            if (processed + skipped) >= MAX_PRODUCTS:
                 break
 
             n = e.get("node") or {}
+            scanned += 1
             notes = []
             desc_updated = False
             uploaded = 0
@@ -412,132 +398,25 @@ def main():
                 has_img   = len(img_edges) > 0
                 body_html = safe_strip(n.get("bodyHtml"))
                 has_desc  = bool(body_html)
+
                 if has_img or has_desc:
-                    processed += 1
+                    title  = safe_strip(n.get("title"))
+                    vendor = safe_strip(n.get("vendor"))
+                    ean    = first_barcode(n.get("variants"))
+                    why = []
+                    if has_img:  why.append("ha già immagini")
+                    if has_desc: why.append("ha già descrizione")
+                    print(product_header(title, vendor, ean) + " - SKIP: " + ", ".join(why))
+                    skipped += 1
+                    results.append({
+                        "product_id": product_id_from_gid(n["id"]),
+                        "title": title, "vendor": vendor, "ean": ean,
+                        "images_uploaded": 0, "description_updated": False,
+                        "notes": "skip: " + ", ".join(why)
+                    })
                     continue
 
                 # --- campi principali ---
                 title  = safe_strip(n.get("title"))
                 vendor = safe_strip(n.get("vendor"))
-                ptype  = safe_strip(n.get("productType"))
-                ean    = first_barcode(n.get("variants"))
-                if not title:
-                    notes.append("skip: titolo mancante")
-                    processed += 1
-                    results.append({
-                        "product_id": "", "title": "", "vendor": vendor, "ean": ean,
-                        "images_uploaded": uploaded, "description_updated": desc_updated, "notes": "; ".join(notes)
-                    })
-                    continue
-
-                pid_num = product_id_from_gid(n["id"])
-                print(f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'}")
-
-                # --- DESCRIZIONE ---
-                if USE_SHOPIFY_MAGIC_ONLY:
-                    try:
-                        set_product_metafield_gql(n["id"], "ai_flags", "needs_description", "true")
-                        notes.append("flag Magic impostato")
-                        print("  - Flag impostato: ai_flags.needs_description=true (usa Shopify Magic dall’Admin)")
-                    except Exception as ex:
-                        notes.append(f"flag Magic errore: {ex}")
-                        print(f"  - ERRORE flag Magic: {ex}")
-                else:
-                    try:
-                        desc_html = gen_description_html(title, vendor, ptype, ean)
-                        update_description(pid_num, desc_html)
-                        desc_updated = True
-                        print("  - Descrizione aggiornata ✅")
-                    except Exception as ex:
-                        notes.append(f"descrizione errore: {ex}")
-                        print(f"  - ERRORE descrizione: {ex}")
-
-                # --- IMMAGINI (fino a 5, white background) ---
-                img_urls = []
-                if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
-                    base = " ".join([x for x in [vendor, title, "product"] if x]).strip()
-                    queries = []
-                    if ean:
-                        queries += [
-                            f"{base} {ean}",
-                            f"{vendor} {title} {ean} packshot",
-                            f"{vendor} {title} {ean} white background",
-                        ]
-                    queries += [
-                        base,
-                        f"{vendor} {title}".strip(),
-                        f"{vendor} {title} packshot".strip(),
-                        f"{vendor} {title} white background".strip(),
-                        f"{vendor} {title} studio".strip(),
-                        f"{vendor} {title} site:{(vendor or '').lower()}.com".strip(),
-                    ]
-
-                    candidates = collect_candidate_images(queries, vendor=vendor)
-                    img_urls = filter_and_select_images(candidates, vendor=vendor, want_n=MAX_IMAGES_PER_PRODUCT)
-
-                if img_urls:
-                    for u in img_urls:
-                        try:
-                            img_id = add_image(pid_num, u, alt_text=f"{vendor} {title}".strip())
-                            uploaded += 1
-                            print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
-                        except Exception as ex:
-                            notes.append(f"img errore: {ex}")
-                            print(f"  - ERRORE immagine: {ex}")
-                    if uploaded == 0:
-                        notes.append("nessuna immagine caricata (tutte fallite)")
-                        print("  - Nessuna immagine caricata (tutte fallite).")
-                else:
-                    notes.append("nessuna immagine white-bg trovata")
-                    print("  - Nessuna immagine white-bg trovata per la query.")
-
-                processed += 1
-
-            except Exception as ex:
-                notes.append(f"errore prodotto: {ex}")
-                print(f"[ERROR prodotto] {ex}")
-                traceback.print_exc()
-                processed += 1
-
-            # append result row (✔️ blocco chiuso correttamente)
-            results.append({
-                "product_id": pid_num if 'pid_num' in locals() else "",
-                "title": title if 'title' in locals() else "",
-                "vendor": vendor if 'vendor' in locals() else "",
-                "ean": ean if 'ean' in locals() else "",
-                "images_uploaded": uploaded,
-                "description_updated": desc_updated,
-                "notes": "; ".join(notes)
-            })
-
-        if not has_next:
-            break
-
-    # --- REPORT CSV ---
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"report_autofill_{ts}.csv"
-    try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["product_id","title","vendor","ean","images_uploaded","description_updated","notes"])
-            w.writeheader()
-            for row in results:
-                w.writerow(row)
-        print(f"[REPORT] Salvato: {csv_path}")
-    except Exception as e:
-        print(f"[REPORT ERROR] {e}")
-
-    print(f"Fatto. Prodotti processati: {processed}")
-
-# ========= ENTRYPOINT =========
-if __name__ == "__main__":
-    try:
-        print(f"[INFO] Using store: {SHOPIFY_STORE_DOMAIN}")
-        fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
-        print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
-        main()
-        sys.exit(0)
-    except Exception as e:
-        print("=== UNCAUGHT ERROR ===")
-        print(repr(e))
-        traceback.print_exc()
-        sys.exit(0)
+                ptype  = safe_strip(n.get("productType
