@@ -2,14 +2,13 @@ import os, sys, html, json, csv, re, traceback, requests
 from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
-
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-19-v7j"
+VERSION = "2025-09-19-v7l"
 load_dotenv()
 
-# ====== CONFIG
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "city-tre-srl.myshopify.com")
+# ========= CONFIG =========
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "")
 SHOPIFY_API_VERSION  = os.getenv("SHOPIFY_API_VERSION", "2025-01")
 SHOPIFY_ADMIN_TOKEN  = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
 
@@ -26,25 +25,28 @@ MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
 SAFE_DOMAINS_HINTS   = ["cdn","images","media","static","assets","content","img","cloudfront","akamaized"]
 WHITE_BG_KEYWORDS    = ["white","bianco","packshot","studio","product","plain","ghost","sfondo-bianco"]
 BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST","").split(",") if d.strip()]
-DOMAINS_BLACKLIST = ["ebay.","aliexpress.","pinterest.","facebook.","tumblr.","wordpress.","blogspot.","vk.","tiktok.","twitter.","x.com","instagram.","lacentrale.","subito.","kijiji.","mercatinousato."]
+DOMAINS_BLACKLIST    = ["ebay.","aliexpress.","pinterest.","facebook.","tumblr.","wordpress.","blogspot.","vk.","tiktok.","twitter.","x.com","instagram."]
 
 WHITE_BG_BORDER_PCT  = float(os.getenv("WHITE_BG_BORDER_PCT","0.12"))
 WHITE_BG_THRESHOLD   = int(os.getenv("WHITE_BG_THRESHOLD","242"))
 WHITE_BG_MIN_RATIO   = float(os.getenv("WHITE_BG_MIN_RATIO","0.82"))
 DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC","8"))
 MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES","3500000"))
-STRICT_EAN_IMAGE_MATCH = os.getenv("STRICT_EAN_IMAGE_MATCH","true").lower()=="true"
-STRICT_EAN_DESC_ONLY   = os.getenv("STRICT_EAN_DESC_ONLY","true").lower()=="true"
-CONTEXT_FETCH_MAX    = int(os.getenv("CONTEXT_FETCH_MAX","250000")) # 250KB
+
+# NUOVI flag "code" (SKU o EAN)
+STRICT_CODE_IMAGE_MATCH = os.getenv("STRICT_CODE_IMAGE_MATCH","true").lower()=="true"
+STRICT_CODE_DESC_ONLY   = os.getenv("STRICT_CODE_DESC_ONLY","true").lower()=="true"
+CONTEXT_FETCH_MAX       = int(os.getenv("CONTEXT_FETCH_MAX","250000"))  # bytes
 
 DEBUG = os.getenv("DEBUG","false").lower()=="true"
 ADMIN_URL_TEMPLATE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/products/{{pid}}"
 
+# Filtri input
 ALLOWED_IDS  = [x.strip() for x in os.getenv("PRODUCT_IDS","").split(",") if x.strip()]
 ALLOWED_SKUS = [x.strip() for x in os.getenv("PRODUCT_SKUS","").split(",") if x.strip()]
 ALLOWED_EANS = [x.strip() for x in os.getenv("PRODUCT_EANS","").split(",") if x.strip()]
 
-# ====== UTILS
+# ========= UTILS =========
 def safe_get(d,*path,default=None):
     cur=d or {}
     for k in path:
@@ -63,12 +65,13 @@ def gid_from_product_id(pid:int)->str:
     return f"gid://shopify/Product/{pid}"
 
 def domain(u):
-    try: return urlparse(u).netloc.lower()
-    except: return ""
+    try: 
+        return urlparse(u).netloc.lower()
+    except: 
+        return ""
 
 def score_image_url(u,vendor=""):
-    d=domain(u or "")
-    s=0
+    d=domain(u or ""); s=0
     if any(wh in d for wh in BRAND_DOMAINS_WHITELIST if wh): s-=6
     if vendor and vendor.lower().replace(" ","") in d.replace("-","").replace(" ",""): s-=3
     if any(h in d for h in SAFE_DOMAINS_HINTS): s-=2
@@ -84,6 +87,15 @@ def first_barcode(variants):
         if bc: return bc
     return ""
 
+def collect_all_skus(variants):
+    edges = safe_get(variants,"edges",default=[]) or []
+    out=[]
+    for e in edges:
+        n=e.get("node") or {}
+        sku=safe_strip(n.get("sku"))
+        if sku: out.append(sku)
+    return out
+
 def variant_selected_options(variants):
     edges=safe_get(variants,"edges",default=[]) or []
     out={}
@@ -97,7 +109,7 @@ def variant_selected_options(variants):
             if name in ["size","taglia","misura"]: out["size"]=val
     return out
 
-# ====== Shopify
+# ========= Shopify API =========
 def shopify_graphql(q, vars_=None):
     url=f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
     h={"X-Shopify-Access-Token":SHOPIFY_ADMIN_TOKEN,"Content-Type":"application/json"}
@@ -107,17 +119,27 @@ def shopify_graphql(q, vars_=None):
     if "errors" in j: raise RuntimeError(j["errors"])
     return j["data"]
 
-def add_image(pid:int, src:str, alt:str=""):
-    url=f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{pid}/images.json"
-    h={"X-Shopify-Access-Token":SHOPIFY_ADMIN_TOKEN,"Content-Type":"application/json"}
-    r=requests.post(url, json={"image":{"src":src,"alt":alt[:255]}}, headers=h, timeout=30)
-    r.raise_for_status(); return safe_get(r.json(),"image","id")
+def shopify_rest_get(path, params=None):
+    url=f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}{path}"
+    h={"X-Shopify-Access-Token":SHOPIFY_ADMIN_TOKEN}
+    r=requests.get(url, headers=h, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-def update_description(pid:int, body_html:str):
-    url=f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{pid}.json"
-    h={"X-Shopify-Access-Token":SHOPIFY_ADMIN_TOKEN,"Content-Type":"application/json"}
-    r=requests.put(url, json={"product":{"id":pid,"body_html":body_html}}, headers=h, timeout=30)
-    r.raise_for_status(); return True
+def add_image(product_id_num: int, image_src: str, alt_text: str=""):
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id_num}/images.json"
+    h = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
+    payload = {"image": {"src": image_src, "alt": (alt_text or "")[:255]}}
+    r = requests.post(url, json=payload, headers=h, timeout=30)
+    r.raise_for_status()
+    return safe_get(r.json(), "image", "id")
+
+def update_description(product_id_num: int, body_html: str):
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id_num}.json"
+    h = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
+    r = requests.put(url, json={"product": {"id": product_id_num, "body_html": body_html}}, headers=h, timeout=30)
+    r.raise_for_status()
+    return True
 
 def fetch_products_by_variants_query(terms, kind="sku"):
     if not terms: return []
@@ -130,13 +152,13 @@ def fetch_products_by_variants_query(terms, kind="sku"):
           product{
             id title vendor productType handle status bodyHtml tags
             images(first:1){ edges{ node{ id } } }
-            variants(first:20){ edges{ node{ id sku barcode title selectedOptions{ name value } } } }
+            variants(first:30){ edges{ node{ id sku barcode title selectedOptions{ name value } } } }
           }
         }}
       }
     }"""
     for t in terms:
-        data=shopify_graphql(q,{"first":20,"query":f"{kind}:{t}"})
+        data=shopify_graphql(q,{"first":30,"query":f"{kind}:{t}"})
         edges=safe_get(data,"productVariants","edges",default=[]) or []
         for e in edges:
             prod=safe_get(e,"node","product")
@@ -151,7 +173,7 @@ def fetch_products_by_product_ids(id_list):
         ... on Product {
           id title vendor productType handle status bodyHtml tags
           images(first:1){ edges{ node{ id } } }
-          variants(first:20){ edges{ node{ id sku barcode title selectedOptions{ name value } } } }
+          variants(first:30){ edges{ node{ id sku barcode title selectedOptions{ name value } } } }
         }
       }
     }"""
@@ -159,7 +181,7 @@ def fetch_products_by_product_ids(id_list):
     nodes=shopify_graphql(q,{"ids":gids}).get("nodes") or []
     return [{"node":n} for n in nodes if n]
 
-# ====== Search (con context)
+# ========= Search (immagini + pagine) =========
 def bing_image_search(qry,count=50,pages=2):
     if not BING_IMAGE_KEY: return []
     url="https://api.bing.microsoft.com/v7.0/images/search"
@@ -196,6 +218,16 @@ def google_cse_image_search(qry, per_page=10, pages=3):
             print(f"[Google CSE EXC] {e}"); break
     return out
 
+def google_cse_web_search(qry, num=10):
+    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX): return []
+    base="https://www.googleapis.com/customsearch/v1"
+    try:
+        r=requests.get(base, params={"key":GOOGLE_CSE_KEY,"cx":GOOGLE_CSE_CX,"q":qry,"num":num,"safe":"active"}, timeout=20)
+        if r.status_code>=400: return []
+        return r.json().get("items",[]) or []
+    except Exception:
+        return []
+
 def _http_get_text(url, limit_bytes=250000):
     try:
         with requests.get(url, timeout=10, stream=True) as r:
@@ -203,14 +235,11 @@ def _http_get_text(url, limit_bytes=250000):
             total=0; chunks=[]
             for ch in r.iter_content(8192):
                 if not ch: continue
-                try:
-                    t = ch.decode("utf-8","ignore")
-                except:
-                    t = ch.decode("latin-1","ignore")
+                try: t = ch.decode("utf-8","ignore")
+                except: t = ch.decode("latin-1","ignore")
                 total += len(t)
                 if total>limit_bytes:
-                    chunks.append(t[:max(0,limit_bytes-(total-len(t)))])
-                    break
+                    chunks.append(t[:max(0,limit_bytes-(total-len(t)))]); break
                 chunks.append(t)
             return "".join(chunks)
     except Exception:
@@ -230,7 +259,7 @@ def _download_bytes(url):
     except Exception:
         return None
 
-# ====== Image checks
+# ========= Image checks =========
 def _ahash(img, hash_size=8):
     from PIL import Image
     im=img.convert("L").resize((hash_size,hash_size),Image.BILINEAR)
@@ -255,12 +284,12 @@ def _is_white_bg(img):
             tot+=1
     return (white/max(1,tot))>=WHITE_BG_MIN_RATIO
 
-def _context_has_ean(text, ean):
-    e=re.escape(ean)
-    return re.search(rf"(^|[^0-9]){e}([^0-9]|$)", text or "", re.I) is not None
+def _context_has_code(text, code):
+    if not code: return False
+    c=re.escape(code)
+    return re.search(rf"(^|[^A-Za-z0-9]){c}([^A-Za-z0-9]|$)", text or "", re.I) is not None
 
 def _extract_product_structured(text):
-    # prova a leggere JSON-LD Product
     try:
         soup=BeautifulSoup(text,"lxml")
         meta_title = (soup.title.string if soup.title else "") or ""
@@ -279,9 +308,9 @@ def _extract_product_structured(text):
         prod={}
         for d in candidates:
             if not isinstance(d, dict): continue
-            if (d.get("@type")=="Product") or ("Product" in (d.get("@type") or [])):
+            t=d.get("@type")
+            if t=="Product" or (isinstance(t,list) and "Product" in t):
                 prod.update(d)
-        # normalizza
         info = {
             "title": prod.get("name") or og_title or meta_title,
             "brand":  (prod.get("brand",{}) or {}).get("name") if isinstance(prod.get("brand"),dict) else prod.get("brand"),
@@ -291,19 +320,20 @@ def _extract_product_structured(text):
             "color":  prod.get("color"),
             "material": prod.get("material"),
         }
-        # estrai tabelline basiche
+        # hint specs
         specs = {}
         for th in soup.find_all(["th","td"]):
             t = (th.get_text(" ", strip=True) or "").lower()
             if not t: continue
-            if "material" in t or "composizione" in t: specs["material_hint"]=t
+            if "composizione" in t or "material" in t: specs["material_hint"]=t
             if "colore" in t or "color" in t: specs["color_hint"]=t
         info["specs"]=specs
         return info
     except Exception:
         return {}
 
-def collect_candidate_images(queries, vendor="", ean=""):
+# ========= Candidate gather & filters =========
+def collect_candidate_images(queries, vendor="", code=""):
     items=[]; seen=set()
     for q in queries:
         g=google_cse_image_search(q, per_page=10, pages=3) if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else []
@@ -311,47 +341,39 @@ def collect_candidate_images(queries, vendor="", ean=""):
         for it in (g+b):
             c=it.get("content"); ctx=it.get("context")
             if not c or c in seen: continue
-            # scarta domini blacklist subito
             if any(bad in domain(c) for bad in DOMAINS_BLACKLIST): continue
             seen.add(c); items.append({"content":c,"context":ctx})
-    # ordina
     items.sort(key=lambda it: score_image_url(it["content"], vendor))
-    # filtro EAN strict
-    if ean and STRICT_EAN_IMAGE_MATCH:
+    if code and STRICT_CODE_IMAGE_MATCH:
         filtered=[]
         for it in items:
-            url= (it["content"] or "").lower()
-            d=domain(url)
-            if any(b in d for b in DOMAINS_BLACKLIST): continue
-            if ean in url:  # ean nel filename/url
+            url=(it["content"] or "").lower()
+            if code.lower() in url:
                 filtered.append(it); continue
             ctx=it.get("context")
             if ctx:
                 txt=_http_get_text(ctx, limit_bytes=CONTEXT_FETCH_MAX)
                 if not txt: continue
-                if _context_has_ean(txt, ean):
+                if _context_has_code(txt, code):
                     filtered.append(it); continue
-                # prova JSON-LD
                 info=_extract_product_structured(txt)
-                if (safe_strip(info.get("gtin13"))==ean) or (safe_strip(info.get("sku"))==ean) or (safe_strip(info.get("mpn"))==ean):
+                if any(safe_strip(info.get(k)).lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"]):
                     filtered.append(it); continue
         items=filtered
     return items
 
-def filter_and_select_images(candidates, vendor="", title="", ean="", want_n=5):
+def filter_and_select_images(candidates, vendor="", title="", want_n=5):
     from PIL import Image
     selected=[]; seen_hash=set()
-    title_tokens = [t.lower() for t in re.findall(r"[a-z0-9]+", title or "") if len(t)>3][:4]
+    tokens = [t.lower() for t in re.findall(r"[a-z0-9]+", (title or "")) if len(t)>3][:4]
     for it in candidates:
         if len(selected)>=want_n: break
-        url=it["content"]; ctx=it.get("context") or ""
+        url=it["content"]; ctx=(it.get("context") or "").lower()
         d=domain(url)
-        # preferisci se brand/whitelist o titolo compare nella context url
-        penalty = 0
-        if not any(w in d for w in BRAND_DOMAINS_WHITELIST): penalty += 1
-        if title_tokens and ctx and not any(t in (ctx.lower()) for t in title_tokens): penalty += 1
-        if penalty>=2: # troppo debole
-            continue
+        penalty=0
+        if BRAND_DOMAINS_WHITELIST and not any(w in d for w in BRAND_DOMAINS_WHITELIST): penalty+=1
+        if tokens and ctx and not any(t in ctx for t in tokens): penalty+=1
+        if penalty>=2: continue
         data=_download_bytes(url)
         if not data: continue
         try:
@@ -366,221 +388,68 @@ def filter_and_select_images(candidates, vendor="", title="", ean="", want_n=5):
             continue
     return selected
 
-# ====== Description (personalizzata da pagina EAN)
-def build_unique_description_from_page(title, vendor, ptype, ean, page_text, info):
-    # prendi titolo dal page info se credibile
+# ========= Descrizione =========
+def build_unique_description_from_page(title, vendor, ptype, code, info):
     title_src = safe_strip(info.get("title")) or title
     brand_src = safe_strip(info.get("brand")) or vendor
-    color = safe_strip(info.get("color")) or ""
-    material = safe_strip(info.get("material")) or ""
-    if not material:
-        mh = safe_strip(safe_get(info,"specs","material_hint"))
-        if mh: material = mh.replace("composizione","").replace("material","").strip(": ").title()
-
+    color     = safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
+    material  = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
     title_h = html.escape(title_src or title or "Prodotto moda")
     brand_h = html.escape(brand_src or "")
     ptype_h = html.escape(ptype or "Abbigliamento")
     color_h = html.escape(color) if color else ""
-    ean_h = html.escape(ean or "N/D")
-
+    code_h  = html.escape(code or "N/D")
     par = f"<p>{title_h}"
     if brand_h: par += f" di {brand_h}"
-    par += f": {ptype_h.lower()} progettato per un uso quotidiano, con attenzione a comfort e durata."
+    par += f": {ptype_h.lower()} pensato per l’uso quotidiano, con attenzione a comfort e durata."
     if color_h: par += f" Colore: {color_h}."
-    if material: par += f" Materiali/Composizione: {html.escape(material)}."
-    par += f" Codice articolo (EAN): {ean_h}.</p>"
-
+    if material: par += f" Composizione/Materiali: {html.escape(material)}."
+    par += f" Codice articolo: {code_h}.</p>"
     bullets = []
     if material: bullets.append(f"Composizione: {html.escape(material)}")
     if color_h: bullets.append(f"Colore: {color_h}")
-    bullets.append("Vestibilità equilibrata e finiture pulite")
-    bullets.append("Cura: seguire le indicazioni in etichetta")
-    bullets.append("Adatto a diverse occasioni d'uso")
-    ul = "<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
+    bullets += ["Vestibilità confortevole e finiture curate",
+                "Cura: seguire le indicazioni in etichetta",
+                "Adatto a diverse occasioni d’uso"]
+    ul = "<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:5]) + "</ul>"
     return par + ul
 
-def gen_description_from_sources(title, vendor, ptype, ean, queries):
-    # cerca pagine dove l'EAN è certo
-    pages = []
+def gen_description_from_sources(title, vendor, ptype, code):
+    queries=[f"\"{code}\"", f"{vendor} {code}", f"{title} {code}"]
+    pages=[]
     for q in queries:
-        # usa google per pagine web (non immagini)
-        items=[]
-        if GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
-            base="https://www.googleapis.com/customsearch/v1"
-            try:
-                r=requests.get(base, params={"key":GOOGLE_CSE_KEY,"cx":GOOGLE_CSE_CX,"q":q,"num":10,"safe":"active"}, timeout=20)
-                if r.status_code<400:
-                    items = r.json().get("items",[]) or []
-            except: pass
+        items = google_cse_web_search(q, num=8)
         for it in items:
             link = it.get("link"); d=domain(link)
             if not link: continue
             if any(b in d for b in DOMAINS_BLACKLIST): continue
-            if BRAND_DOMAINS_WHITELIST and not any(w in d for w in BRAND_DOMAINS_WHITELIST):
-                # accetta anche retailer comuni credibili (*.it/*.com) ma evita forum/social
-                if any(b in d for b in ["amazon.","zalando.","zara.","unavailable"]):
-                    pass
             txt=_http_get_text(link, limit_bytes=CONTEXT_FETCH_MAX)
             if not txt: continue
-            if not _context_has_ean(txt, ean):
-                info=_extract_product_structured(txt)
-                if not (safe_strip(info.get("gtin13"))==ean or safe_strip(info.get("gtin"))==ean or safe_strip(info.get("sku"))==ean or safe_strip(info.get("mpn"))==ean):
-                    continue
-            pages.append((link, txt, _extract_product_structured(txt)))
-            if len(pages)>=2: break
-        if len(pages)>=2: break
-    if not pages:
-        return ""  # nessuna pagina affidabile
-    # usa la prima pagina valida per descrizione
-    _, text, info = pages[0]
-    return build_unique_description_from_page(title, vendor, ptype, ean, text, info)
+            info=_extract_product_structured(txt)
+            ok = _context_has_code(txt, code) or any(safe_strip(info.get(k)).lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"])
+            if ok:
+                pages.append((link, info))
+        if pages: break
+    if not pages: 
+        return "", None
+    link, info = pages[0]
+    desc_html = build_unique_description_from_page(title, vendor, ptype, code, info)
+    return desc_html, link
 
-# ====== MAIN
-def main():
-    print(f"[START] draft_fashion_autofill {VERSION}")
-    fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
-    if DEBUG:
-        print(f"[DEBUG] Fonte immagini: {fonte} | STRICT_EAN_IMAGE_MATCH={STRICT_EAN_IMAGE_MATCH} | STRICT_EAN_DESC_ONLY={STRICT_EAN_DESC_ONLY}")
-
-    processed=scanned=skipped=0
-    results=[]
-
-    # seleziona prodotti (preferisci EAN/SKU)
-    edges=[]
-    if ALLOWED_SKUS: edges += fetch_products_by_variants_query(ALLOWED_SKUS, kind="sku")
-    if ALLOWED_EANS: edges += fetch_products_by_variants_query(ALLOWED_EANS, kind="barcode")
-    # se PRODUCT_IDS contiene EAN (8-14 cifre) trattali come barcode:
-    if ALLOWED_IDS:
-        as_ean=[x for x in ALLOWED_IDS if x.isdigit() and 8<=len(x)<=14]
-        pure_ids=[x for x in ALLOWED_IDS if not (x.isdigit() and 8<=len(x)<=14)]
-        if as_ean: edges += fetch_products_by_variants_query(as_ean, kind="barcode")
-        if pure_ids: edges += fetch_products_by_product_ids(pure_ids)
-
-    # dedup
-    uniq={}
-    for e in edges:
-        n=e.get("node"); 
-        if n: uniq[n["id"]]=e
-    edges=list(uniq.values())
-    if not edges:
-        print("[INFO] Nessun prodotto trovato (controlla PRODUCT_EANS / PRODUCT_SKUS).")
-        report_and_exit(results, scanned, processed, skipped); return
-
-    for e in edges:
-        if (processed+skipped)>=MAX_PRODUCTS: break
-        n=e.get("node") or {}
-        scanned+=1
-        notes=[]; desc_updated=False; uploaded=0
-
-        try:
-            pid=product_id_from_gid(n["id"])
-            title=safe_strip(n.get("title"))
-            vendor=safe_strip(n.get("vendor"))
-            ptype=safe_strip(n.get("productType"))
-            tags=n.get("tags") or []
-            ean=first_barcode(n.get("variants"))
-            selopts=variant_selected_options(n.get("variants"))
-            status=safe_strip(n.get("status"))
-
-            if status and status.lower()!="draft":
-                skipped+=1
-                print(f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'} - SKIP: status non DRAFT")
-                results.append(row(pid,title,vendor,ean,0,False,"skip: status non DRAFT")); continue
-
-            has_img = len(safe_get(n,"images","edges",default=[]) or [])>0
-            has_desc = bool(safe_strip(n.get("bodyHtml")))
-            if has_img or has_desc:
-                why=[]; 
-                if has_img: why.append("ha già immagini")
-                if has_desc: why.append("ha già descrizione")
-                print(f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'} - SKIP: " + ", ".join(why))
-                skipped+=1
-                results.append(row(pid,title,vendor,ean,0,False,"skip: "+", ".join(why))); continue
-
-            if not title:
-                skipped+=1
-                print("[PROCESS] SKIP: titolo mancante")
-                results.append(row(pid,"",vendor,ean,0,False,"skip: titolo mancante")); continue
-
-            print(f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'}")
-
-            # --- DESCRIZIONE (EAN-driven)
-            if USE_SHOPIFY_MAGIC_ONLY:
-                try:
-                    # opzionale: flag per Magic (namespace >=3 char)
-                    shopify_graphql("""
-                    mutation($m:[MetafieldsSetInput!]!){
-                      metafieldsSet(metafields:$m){ userErrors{ field message code } }
-                    }""", {"m":[{"ownerId":n["id"],"namespace":"ai_flags","key":"needs_description","type":"single_line_text_field","value":"true"}]})
-                    print("  - Flag per Shopify Magic impostato")
-                except Exception as ex:
-                    notes.append(f"flag Magic errore: {ex}"); print(f"  - ERRORE flag Magic: {ex}")
-            else:
-                desc_html=""
-                # Query per pagina affidabile (EAN nel testo o JSON-LD)
-                if ean:
-                    q_list=[f"\"{ean}\"", f"{vendor} {ean}", f"{title} {ean}"]
-                    desc_html = gen_description_from_sources(title, vendor, ptype, ean, q_list)
-                if not desc_html:
-                    if STRICT_EAN_DESC_ONLY:
-                        notes.append("descrizione non aggiornata: nessuna sorgente EAN affidabile")
-                        print("  - Nessuna pagina affidabile con EAN: descrizione NON aggiornata")
-                    else:
-                        # fallback personalizzato leggero (ancora diverso per EAN)
-                        desc_html = f"<p>{html.escape(title)} di {html.escape(vendor)}: {html.escape(ptype or 'prodotto')}. Codice EAN: {html.escape(ean or 'N/D')}.</p><ul><li>Dettagli essenziali</li><li>Materiali e cura in etichetta</li><li>Vestibilità confortevole</li></ul>"
-                if desc_html:
-                    update_description(pid, desc_html); desc_updated=True; print("  - Descrizione aggiornata ✅")
-
-            # --- IMMAGINI (EAN strict + white bg + dedup + min 600px)
-            img_urls=[]
-            if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
-                base=" ".join([x for x in [vendor,title,"product"] if x]).strip()
-                q_img=[]
-                if ean:
-                    q_img += [f"\"{ean}\"", f"{vendor} {ean}", f"{title} {ean} packshot", f"{vendor} {title} {ean} white background"]
-                    q_img += [f"site:{d} {ean}" for d in BRAND_DOMAINS_WHITELIST]
-                q_img += [f"{base} packshot", f"{base} white background"]
-                cands = collect_candidate_images(q_img, vendor=vendor, ean=ean)
-                img_urls = filter_and_select_images(cands, vendor=vendor, title=title, ean=ean, want_n=MAX_IMAGES_PER_PRODUCT)
-
-            if img_urls:
-                for u in img_urls:
-                    try:
-                        img_id=add_image(pid, u, alt=f"{vendor} {title}".strip()); uploaded+=1
-                        print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
-                    except Exception as ex:
-                        notes.append(f"img errore: {ex}"); print(f"  - ERRORE immagine: {ex}")
-                print(f"  - Immagini caricate: {uploaded} ✅")
-            else:
-                print("  - Nessuna immagine con EAN confermato (nessun upload).")
-
-            if desc_updated or uploaded>0:
-                print(f"  Admin: {ADMIN_URL_TEMPLATE.format(pid=pid)}")
-
-            if desc_updated or uploaded>0: processed+=1
-            else: skipped+=1
-
-            results.append(row(pid,title,vendor,ean,uploaded,desc_updated,"; ".join(notes)))
-
-        except Exception as ex:
-            skipped+=1
-            print(f"[ERROR prodotto] {ex}"); traceback.print_exc()
-            results.append(row(pid if 'pid' in locals() else "", title if 'title' in locals() else "",
-                               vendor if 'vendor' in locals() else "", ean if 'ean' in locals() else "",
-                               0, False, f"errore prodotto: {ex}"))
-
-    report_and_exit(results, scanned, processed, skipped)
-
-def row(pid, title, vendor, ean, uploaded, desc_updated, notes):
-    return {"product_id": pid, "title": title, "vendor": vendor, "ean": ean,
-            "images_uploaded": uploaded, "description_updated": bool(desc_updated), "notes": notes}
+# ========= MAIN =========
+def row(pid, title, vendor, code, uploaded, desc_updated, notes, context_url="", image_urls=""):
+    return {
+        "product_id": pid, "title": title, "vendor": vendor, "code": code,
+        "images_uploaded": uploaded, "description_updated": bool(desc_updated),
+        "notes": notes, "context_url": context_url, "image_urls": image_urls
+    }
 
 def report_and_exit(results, scanned, processed, skipped):
     ts=datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path=f"report_autofill_{ts}.csv"
     try:
         with open(csv_path,"w",newline="",encoding="utf-8") as f:
-            w=csv.DictWriter(f, fieldnames=["product_id","title","vendor","ean","images_uploaded","description_updated","notes"])
+            w=csv.DictWriter(f, fieldnames=["product_id","title","vendor","code","images_uploaded","description_updated","notes","context_url","image_urls"])
             w.writeheader()
             for r in results: w.writerow(r)
         print(f"[REPORT] Salvato: {csv_path}")
@@ -593,15 +462,162 @@ def report_and_exit(results, scanned, processed, skipped):
         print(f"[REPORT ERROR] {e}")
     print(f"[SUMMARY] Scanned: {scanned} | Updated: {processed} | Skipped: {skipped}")
 
+def main():
+    print(f"[START] draft_fashion_autofill {VERSION}")
+    fonte="Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
+    if DEBUG:
+        print(f"[DEBUG] Fonte: {fonte} | STRICT_CODE_IMAGE_MATCH={STRICT_CODE_IMAGE_MATCH} | STRICT_CODE_DESC_ONLY={STRICT_CODE_DESC_ONLY}")
+
+    processed=scanned=skipped=0
+    results=[]
+
+    # selezione prodotti (SKU > EAN > IDs)
+    edges=[]
+    if ALLOWED_SKUS: edges += fetch_products_by_variants_query(ALLOWED_SKUS, kind="sku")
+    if ALLOWED_EANS: edges += fetch_products_by_variants_query(ALLOWED_EANS, kind="barcode")
+    if ALLOWED_IDS:
+        as_ean=[x for x in ALLOWED_IDS if x.isdigit() and 8<=len(x)<=14]
+        pure_ids=[x for x in ALLOWED_IDS if not (x.isdigit() and 8<=len(x)<=14)]
+        if as_ean: edges += fetch_products_by_variants_query(as_ean, kind="barcode")
+        if pure_ids: edges += fetch_products_by_product_ids(pure_ids)
+
+    # dedup per product.id
+    uniq={}
+    for e in edges:
+        n=e.get("node"); 
+        if n: uniq[n["id"]]=e
+    edges=list(uniq.values())
+    if not edges:
+        print("[INFO] Nessun prodotto trovato (usa PRODUCT_SKUS nel .env).")
+        report_and_exit(results, scanned, processed, skipped); return
+
+    # set SKU target per match
+    TARGET_SKUS = set(s.lower() for s in ALLOWED_SKUS)
+
+    for e in edges:
+        if (processed+skipped)>=MAX_PRODUCTS: break
+        n=e.get("node") or {}
+        scanned+=1
+        notes=[]; desc_updated=False; uploaded=0
+        used_context_url=""; uploaded_urls=[]
+
+        try:
+            pid=product_id_from_gid(n["id"])
+            title=safe_strip(n.get("title"))
+            vendor=safe_strip(n.get("vendor"))
+            ptype=safe_strip(n.get("productType"))
+            status=safe_strip(n.get("status"))
+            variants=n.get("variants")
+            all_skus = collect_all_skus(variants)
+            ean = first_barcode(variants)
+
+            # scegli il "code" (preferisci SKU passato in input che corrisponde al prodotto)
+            code = ""
+            for s in all_skus:
+                if s and s.lower() in TARGET_SKUS:
+                    code = s; break
+            if not code:
+                code = all_skus[0] if all_skus else (ean or "")
+
+            if status and status.lower()!="draft":
+                skipped+=1
+                print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code or '-'} - SKIP: status non DRAFT")
+                results.append(row(pid,title,vendor,code,0,False,"skip: status non DRAFT")); continue
+
+            has_img = len(safe_get(n,"images","edges",default=[]) or [])>0
+            has_desc = bool(safe_strip(n.get("bodyHtml")))
+            if has_img or has_desc:
+                why=[]; 
+                if has_img: why.append("ha già immagini")
+                if has_desc: why.append("ha già descrizione")
+                print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code or '-'} - SKIP: " + ", ".join(why))
+                skipped+=1
+                results.append(row(pid,title,vendor,code,0,False,"skip: "+", ".join(why))); continue
+
+            if not title:
+                skipped+=1
+                print("[PROCESS] SKIP: titolo mancante")
+                results.append(row(pid,"",vendor,code,0,False,"skip: titolo mancante")); continue
+
+            print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code or '-'}")
+
+            # --- DESCRIZIONE (SKU-first)
+            if USE_SHOPIFY_MAGIC_ONLY:
+                try:
+                    shopify_graphql("""
+                    mutation($m:[MetafieldsSetInput!]!){
+                      metafieldsSet(metafields:$m){ userErrors{ field message code } }
+                    }""", {"m":[{"ownerId":n["id"],"namespace":"ai_flags","key":"needs_description","type":"single_line_text_field","value":"true"}]})
+                    print("  - Flag Shopify Magic impostato")
+                except Exception as ex:
+                    notes.append(f"flag Magic errore: {ex}"); print(f"  - ERRORE flag Magic: {ex}")
+            else:
+                desc_html=""; context_url=None
+                if code:
+                    desc_html, context_url = gen_description_from_sources(title, vendor, ptype, code)
+                if not desc_html:
+                    if STRICT_CODE_DESC_ONLY:
+                        notes.append("descrizione non aggiornata: nessuna sorgente affidabile per il codice")
+                        print("  - Nessuna pagina affidabile con il codice: descrizione NON aggiornata")
+                    else:
+                        desc_html = f"<p>{html.escape(title)} di {html.escape(vendor)}: {html.escape(ptype or 'prodotto')} (Codice {html.escape(code or 'N/D')}).</p><ul><li>Dettagli essenziali</li><li>Materiali e cura in etichetta</li><li>Vestibilità confortevole</li></ul>"
+                if desc_html:
+                    update_description(pid, desc_html); desc_updated=True; print("  - Descrizione aggiornata ✅")
+                    if context_url: 
+                        used_context_url = context_url
+                        print(f"    • Fonte descrizione: {context_url}")
+
+            # --- IMMAGINI (match sul codice + white bg + dedup)
+            img_urls=[]
+            if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
+                base=" ".join([x for x in [vendor,title,"product"] if x]).strip()
+                q_img=[]
+                if code:
+                    q_img += [f"\"{code}\"", f"{vendor} {code}", f"{title} {code} packshot", f"{vendor} {title} {code} white background"]
+                    q_img += [f"site:{d} {code}" for d in BRAND_DOMAINS_WHITELIST]
+                q_img += [f"{base} packshot", f"{base} white background"]
+                cands = collect_candidate_images(q_img, vendor=vendor, code=code)
+                img_urls = filter_and_select_images(cands, vendor=vendor, title=title, want_n=MAX_IMAGES_PER_PRODUCT)
+
+            if img_urls:
+                for u in img_urls:
+                    try:
+                        img_id=add_image(pid, u, alt_text=f"{vendor} {title}".strip()); uploaded+=1
+                        uploaded_urls.append(u)
+                        print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
+                    except Exception as ex:
+                        notes.append(f"img errore: {ex}"); print(f"  - ERRORE immagine: {ex}")
+                print(f"  - Immagini caricate: {uploaded} ✅")
+            else:
+                print("  - Nessuna immagine coerente con il codice (nessun upload).")
+
+            if desc_updated or uploaded>0:
+                print(f"  Admin: {ADMIN_URL_TEMPLATE.format(pid=pid)}")
+
+            if desc_updated or uploaded>0: processed+=1
+            else: skipped+=1
+
+            results.append(row(pid,title,vendor,code,uploaded,desc_updated,"; ".join(notes), used_context_url, " | ".join(uploaded_urls)))
+
+        except Exception as ex:
+            skipped+=1
+            print(f"[ERROR prodotto] {ex}"); traceback.print_exc()
+            results.append(row(pid if 'pid' in locals() else "", title if 'title' in locals() else "",
+                               vendor if 'vendor' in locals() else "", code if 'code' in locals() else "",
+                               0, False, f"errore prodotto: {ex}"))
+
+    report_and_exit(results, scanned, processed, skipped)
+
+# ========= ENTRY =========
 if __name__ == "__main__":
     try:
         print(f"[INFO] Using store: {SHOPIFY_STORE_DOMAIN}")
         fonte="Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
-        print(f"[INFO] STRICT_EAN_IMAGE_MATCH={STRICT_EAN_IMAGE_MATCH} | STRICT_EAN_DESC_ONLY={STRICT_EAN_DESC_ONLY}")
-        if ALLOWED_SKUS: print(f"[INFO] SKU: {', '.join(ALLOWED_SKUS)}")
-        if ALLOWED_EANS: print(f"[INFO] EAN: {', '.join(ALLOWED_EANS)}")
-        if ALLOWED_IDS:  print(f"[INFO] IDs: {', '.join(ALLOWED_IDS)}")
+        print(f"[INFO] STRICT_CODE_IMAGE_MATCH={STRICT_CODE_IMAGE_MATCH} | STRICT_CODE_DESC_ONLY={STRICT_CODE_DESC_ONLY}")
+        if ALLOWED_SKUS: print(f"[INFO] Filtrando per SKU: {', '.join(ALLOWED_SKUS)}")
+        if ALLOWED_EANS: print(f"[INFO] Filtrando per EAN: {', '.join(ALLOWED_EANS)}")
+        if ALLOWED_IDS:  print(f"[INFO] Filtrando per IDs: {', '.join(ALLOWED_IDS)}")
         main(); sys.exit(0)
     except Exception as e:
         print("=== UNCAUGHT ERROR ==="); print(repr(e)); traceback.print_exc(); sys.exit(0)
