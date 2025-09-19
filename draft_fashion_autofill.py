@@ -4,7 +4,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-19-v7l"
+VERSION = "2025-09-19-v7m"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -33,10 +33,12 @@ WHITE_BG_MIN_RATIO   = float(os.getenv("WHITE_BG_MIN_RATIO","0.82"))
 DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC","8"))
 MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES","3500000"))
 
-# NUOVI flag "code" (SKU o EAN)
 STRICT_CODE_IMAGE_MATCH = os.getenv("STRICT_CODE_IMAGE_MATCH","true").lower()=="true"
 STRICT_CODE_DESC_ONLY   = os.getenv("STRICT_CODE_DESC_ONLY","true").lower()=="true"
 CONTEXT_FETCH_MAX       = int(os.getenv("CONTEXT_FETCH_MAX","250000"))  # bytes
+
+SUPPLIER_CODE_OFFSET    = int(os.getenv("SUPPLIER_CODE_OFFSET", "6"))
+SUPPLIER_CODE_REGEX     = os.getenv("SUPPLIER_CODE_REGEX", "")  # opzionale, es. r"^[A-Z0-9]{6}(?P<code>.+)$"
 
 DEBUG = os.getenv("DEBUG","false").lower()=="true"
 ADMIN_URL_TEMPLATE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/products/{{pid}}"
@@ -78,6 +80,21 @@ def score_image_url(u,vendor=""):
     if any(k in (u or "").lower() for k in WHITE_BG_KEYWORDS): s-=1
     if any(b in d for b in DOMAINS_BLACKLIST): s+=6
     return s
+
+def supplier_code_from_sku(sku: str) -> str:
+    sku = safe_strip(sku)
+    if not sku: return ""
+    if SUPPLIER_CODE_REGEX:
+        try:
+            m = re.search(SUPPLIER_CODE_REGEX, sku)
+            if m and m.groupdict().get("code"):
+                return m.group("code").strip()
+        except Exception:
+            pass
+    # default: taglia via le prime 6 lettere/caratteri
+    if len(sku) > SUPPLIER_CODE_OFFSET:
+        return sku[SUPPLIER_CODE_OFFSET:]
+    return sku
 
 def first_barcode(variants):
     edges = safe_get(variants,"edges",default=[]) or []
@@ -181,7 +198,7 @@ def fetch_products_by_product_ids(id_list):
     nodes=shopify_graphql(q,{"ids":gids}).get("nodes") or []
     return [{"node":n} for n in nodes if n]
 
-# ========= Search (immagini + pagine) =========
+# ========= Search helpers =========
 def bing_image_search(qry,count=50,pages=2):
     if not BING_IMAGE_KEY: return []
     url="https://api.bing.microsoft.com/v7.0/images/search"
@@ -357,7 +374,7 @@ def collect_candidate_images(queries, vendor="", code=""):
                 if _context_has_code(txt, code):
                     filtered.append(it); continue
                 info=_extract_product_structured(txt)
-                if any(safe_strip(info.get(k)).lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"]):
+                if any((safe_strip(info.get(k)) or "").lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"]):
                     filtered.append(it); continue
         items=filtered
     return items
@@ -426,7 +443,7 @@ def gen_description_from_sources(title, vendor, ptype, code):
             txt=_http_get_text(link, limit_bytes=CONTEXT_FETCH_MAX)
             if not txt: continue
             info=_extract_product_structured(txt)
-            ok = _context_has_code(txt, code) or any(safe_strip(info.get(k)).lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"])
+            ok = _context_has_code(txt, code) or any((safe_strip(info.get(k)) or "").lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"])
             if ok:
                 pages.append((link, info))
         if pages: break
@@ -466,12 +483,12 @@ def main():
     print(f"[START] draft_fashion_autofill {VERSION}")
     fonte="Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
     if DEBUG:
-        print(f"[DEBUG] Fonte: {fonte} | STRICT_CODE_IMAGE_MATCH={STRICT_CODE_IMAGE_MATCH} | STRICT_CODE_DESC_ONLY={STRICT_CODE_DESC_ONLY}")
+        print(f"[DEBUG] Fonte: {fonte} | STRICT_CODE_IMAGE_MATCH={STRICT_CODE_IMAGE_MATCH} | STRICT_CODE_DESC_ONLY={STRICT_CODE_DESC_ONLY} | SUPPLIER_CODE_OFFSET={SUPPLIER_CODE_OFFSET}" + (f" | SUPPLIER_CODE_REGEX={SUPPLIER_CODE_REGEX}" if SUPPLIER_CODE_REGEX else ""))
 
     processed=scanned=skipped=0
     results=[]
 
-    # selezione prodotti (SKU > EAN > IDs)
+    # selezione prodotti (primariamente SKU)
     edges=[]
     if ALLOWED_SKUS: edges += fetch_products_by_variants_query(ALLOWED_SKUS, kind="sku")
     if ALLOWED_EANS: edges += fetch_products_by_variants_query(ALLOWED_EANS, kind="barcode")
@@ -491,7 +508,6 @@ def main():
         print("[INFO] Nessun prodotto trovato (usa PRODUCT_SKUS nel .env).")
         report_and_exit(results, scanned, processed, skipped); return
 
-    # set SKU target per match
     TARGET_SKUS = set(s.lower() for s in ALLOWED_SKUS)
 
     for e in edges:
@@ -511,18 +527,25 @@ def main():
             all_skus = collect_all_skus(variants)
             ean = first_barcode(variants)
 
-            # scegli il "code" (preferisci SKU passato in input che corrisponde al prodotto)
-            code = ""
+            # determinare il codice da usare online (supplier code da SKU)
+            chosen_sku = ""
             for s in all_skus:
                 if s and s.lower() in TARGET_SKUS:
-                    code = s; break
-            if not code:
-                code = all_skus[0] if all_skus else (ean or "")
+                    chosen_sku = s; break
+            if not chosen_sku:  # fallback: primo SKU
+                chosen_sku = all_skus[0] if all_skus else ""
+
+            supplier_code = supplier_code_from_sku(chosen_sku) if chosen_sku else ""
+            code_for_search = supplier_code or chosen_sku or ean or ""
+
+            code_msg = code_for_search
+            if supplier_code and chosen_sku and supplier_code != chosen_sku:
+                code_msg = f"{supplier_code} (from SKU {chosen_sku})"
 
             if status and status.lower()!="draft":
                 skipped+=1
-                print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code or '-'} - SKIP: status non DRAFT")
-                results.append(row(pid,title,vendor,code,0,False,"skip: status non DRAFT")); continue
+                print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code_msg} - SKIP: status non DRAFT")
+                results.append(row(pid,title,vendor,code_for_search,0,False,"skip: status non DRAFT")); continue
 
             has_img = len(safe_get(n,"images","edges",default=[]) or [])>0
             has_desc = bool(safe_strip(n.get("bodyHtml")))
@@ -530,18 +553,18 @@ def main():
                 why=[]; 
                 if has_img: why.append("ha già immagini")
                 if has_desc: why.append("ha già descrizione")
-                print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code or '-'} - SKIP: " + ", ".join(why))
+                print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code_msg} - SKIP: " + ", ".join(why))
                 skipped+=1
-                results.append(row(pid,title,vendor,code,0,False,"skip: "+", ".join(why))); continue
+                results.append(row(pid,title,vendor,code_for_search,0,False,"skip: "+", ".join(why))); continue
 
             if not title:
                 skipped+=1
                 print("[PROCESS] SKIP: titolo mancante")
-                results.append(row(pid,"",vendor,code,0,False,"skip: titolo mancante")); continue
+                results.append(row(pid,"",vendor,code_for_search,0,False,"skip: titolo mancante")); continue
 
-            print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code or '-'}")
+            print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code_msg}")
 
-            # --- DESCRIZIONE (SKU-first)
+            # --- DESCRIZIONE (supplier-code first)
             if USE_SHOPIFY_MAGIC_ONLY:
                 try:
                     shopify_graphql("""
@@ -553,30 +576,30 @@ def main():
                     notes.append(f"flag Magic errore: {ex}"); print(f"  - ERRORE flag Magic: {ex}")
             else:
                 desc_html=""; context_url=None
-                if code:
-                    desc_html, context_url = gen_description_from_sources(title, vendor, ptype, code)
+                if code_for_search:
+                    desc_html, context_url = gen_description_from_sources(title, vendor, ptype, code_for_search)
                 if not desc_html:
                     if STRICT_CODE_DESC_ONLY:
                         notes.append("descrizione non aggiornata: nessuna sorgente affidabile per il codice")
                         print("  - Nessuna pagina affidabile con il codice: descrizione NON aggiornata")
                     else:
-                        desc_html = f"<p>{html.escape(title)} di {html.escape(vendor)}: {html.escape(ptype or 'prodotto')} (Codice {html.escape(code or 'N/D')}).</p><ul><li>Dettagli essenziali</li><li>Materiali e cura in etichetta</li><li>Vestibilità confortevole</li></ul>"
+                        desc_html = f"<p>{html.escape(title)} di {html.escape(vendor)}: {html.escape(ptype or 'prodotto')} (Codice {html.escape(code_for_search or 'N/D')}).</p><ul><li>Dettagli essenziali</li><li>Materiali e cura in etichetta</li><li>Vestibilità confortevole</li></ul>"
                 if desc_html:
                     update_description(pid, desc_html); desc_updated=True; print("  - Descrizione aggiornata ✅")
                     if context_url: 
                         used_context_url = context_url
                         print(f"    • Fonte descrizione: {context_url}")
 
-            # --- IMMAGINI (match sul codice + white bg + dedup)
+            # --- IMMAGINI (supplier-code strict + white bg + dedup)
             img_urls=[]
             if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
                 base=" ".join([x for x in [vendor,title,"product"] if x]).strip()
                 q_img=[]
-                if code:
-                    q_img += [f"\"{code}\"", f"{vendor} {code}", f"{title} {code} packshot", f"{vendor} {title} {code} white background"]
-                    q_img += [f"site:{d} {code}" for d in BRAND_DOMAINS_WHITELIST]
+                if code_for_search:
+                    q_img += [f"\"{code_for_search}\"", f"{vendor} {code_for_search}", f"{title} {code_for_search} packshot", f"{vendor} {title} {code_for_search} white background"]
+                    q_img += [f"site:{d} {code_for_search}" for d in BRAND_DOMAINS_WHITELIST]
                 q_img += [f"{base} packshot", f"{base} white background"]
-                cands = collect_candidate_images(q_img, vendor=vendor, code=code)
+                cands = collect_candidate_images(q_img, vendor=vendor, code=code_for_search)
                 img_urls = filter_and_select_images(cands, vendor=vendor, title=title, want_n=MAX_IMAGES_PER_PRODUCT)
 
             if img_urls:
@@ -597,13 +620,13 @@ def main():
             if desc_updated or uploaded>0: processed+=1
             else: skipped+=1
 
-            results.append(row(pid,title,vendor,code,uploaded,desc_updated,"; ".join(notes), used_context_url, " | ".join(uploaded_urls)))
+            results.append(row(pid,title,vendor,code_for_search,uploaded,desc_updated,"; ".join(notes), used_context_url, " | ".join(uploaded_urls)))
 
         except Exception as ex:
             skipped+=1
             print(f"[ERROR prodotto] {ex}"); traceback.print_exc()
             results.append(row(pid if 'pid' in locals() else "", title if 'title' in locals() else "",
-                               vendor if 'vendor' in locals() else "", code if 'code' in locals() else "",
+                               vendor if 'vendor' in locals() else "", code_for_search if 'code_for_search' in locals() else "",
                                0, False, f"errore prodotto: {ex}"))
 
     report_and_exit(results, scanned, processed, skipped)
@@ -618,6 +641,7 @@ if __name__ == "__main__":
         if ALLOWED_SKUS: print(f"[INFO] Filtrando per SKU: {', '.join(ALLOWED_SKUS)}")
         if ALLOWED_EANS: print(f"[INFO] Filtrando per EAN: {', '.join(ALLOWED_EANS)}")
         if ALLOWED_IDS:  print(f"[INFO] Filtrando per IDs: {', '.join(ALLOWED_IDS)}")
+        print(f"[INFO] SUPPLIER_CODE_OFFSET={SUPPLIER_CODE_OFFSET}" + (f" | SUPPLIER_CODE_REGEX={SUPPLIER_CODE_REGEX}" if SUPPLIER_CODE_REGEX else ""))
         main(); sys.exit(0)
     except Exception as e:
         print("=== UNCAUGHT ERROR ==="); print(repr(e)); traceback.print_exc(); sys.exit(0)
