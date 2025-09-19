@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v7e"
+VERSION = "2025-09-19-v7f"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -27,7 +27,6 @@ MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
 # Preferenze selezione immagini
 SAFE_DOMAINS_HINTS   = ["cdn", "images", "media", "static", "assets", "content", "img", "cloudfront", "akamaized"]
 WHITE_BG_KEYWORDS    = ["white", "bianco", "packshot", "studio", "product", "plain"]
-# opzionale: priorità a domini brand (csv): es. "guess.com,guess.eu,calvinklein.it"
 BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST", "").split(",") if d.strip()]
 
 # Controllo sfondo bianco & download
@@ -40,7 +39,7 @@ MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES", "3500000"))  # ~3.5MB
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ADMIN_URL_TEMPLATE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/products/{{pid}}"
 
-# Filtro opzionale: solo questi product IDs (numerici) separati da virgola nel .env
+# Filtro opzionale: processa SOLO questi ID numerici
 ALLOWED_IDS = [x.strip() for x in os.getenv("PRODUCT_IDS", "").split(",") if x.strip()]
 
 # ========= UTILS =========
@@ -62,6 +61,9 @@ def safe_strip(v):
 def product_id_from_gid(gid: str) -> int:
     return int(str(gid).split("/")[-1])
 
+def gid_from_id(pid_num: int) -> str:
+    return f"gid://shopify/Product/{pid_num}"
+
 def first_barcode(variants):
     edges = safe_get(variants, "edges", default=[]) or []
     for edge in edges:
@@ -73,12 +75,12 @@ def first_barcode(variants):
 
 def domain(url):
     try:
-        return urlparse(url).netloc.lower()
+        from urllib.parse import urlparse as _up
+        return _up(url).netloc.lower()
     except Exception:
         return ""
 
 def score_image_url(u, vendor=""):
-    """Heuristics: priorità a CDN/brand, packshot, white background hints; penalizza marketplace/social."""
     u = u or ""
     d = domain(u)
     score = 0
@@ -116,6 +118,7 @@ def fetch_draft_products(limit=50, cursor=None):
             vendor
             productType
             handle
+            status
             bodyHtml
             images(first:1){ edges{ node{ id } } }
             variants(first:10){ edges{ node{ id sku barcode title } } }
@@ -125,6 +128,38 @@ def fetch_draft_products(limit=50, cursor=None):
     }
     """
     return shopify_graphql(q, {"first": limit, "after": cursor})
+
+def fetch_products_by_ids(id_list):
+    """GraphQL nodes(ids:[...]) per prendere esattamente i prodotti richiesti."""
+    if not id_list:
+        return []
+    out = []
+    batch = 50
+    q = """
+    query($ids:[ID!]!){
+      nodes(ids:$ids){
+        ... on Product {
+          id
+          title
+          vendor
+          productType
+          handle
+          status
+          bodyHtml
+          images(first:1){ edges{ node{ id } } }
+          variants(first:10){ edges{ node{ id sku barcode title barcode } } }
+        }
+      }
+    }
+    """
+    for i in range(0, len(id_list), batch):
+        ids_batch = [gid_from_id(int(x)) for x in id_list[i:i+batch]]
+        data = shopify_graphql(q, {"ids": ids_batch})
+        nodes = data.get("nodes") or []
+        # normalizza in "edges-like"
+        for n in nodes:
+            if n: out.append({"node": n})
+    return out
 
 def add_image(product_id_num: int, image_src: str, alt_text: str=""):
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id_num}/images.json"
@@ -142,7 +177,6 @@ def update_description(product_id_num: int, body_html: str):
     return True
 
 def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value: str, mtype: str="single_line_text_field"):
-    """Crea/aggiorna un metafield sul prodotto via GraphQL metafieldsSet (namespace >= 3 char)."""
     mutation = """
     mutation SetMF($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
@@ -158,7 +192,7 @@ def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value:
         raise RuntimeError(f"metafieldsSet errors: {errs}")
     return True
 
-# ========= IMAGE SEARCH (paginazione) =========
+# ========= IMAGE SEARCH =========
 def bing_image_search(query: str, count=50, pages=2):
     if not BING_IMAGE_KEY: return []
     url = "https://api.bing.microsoft.com/v7.0/images/search"
@@ -242,14 +276,12 @@ def _is_white_bg(img):
     white = 0
     total = 0
     thr = WHITE_BG_THRESHOLD
-    # top & bottom
     for y in list(range(0, bh)) + list(range(h - bh, h)):
         for x in range(w):
             r, g, b = px[x, y]
             if r >= thr and g >= thr and b >= thr:
                 white += 1
             total += 1
-    # left & right
     for y in range(bh, h - bh):
         for x in list(range(0, bw)) + list(range(w - bw, w)):
             r, g, b = px[x, y]
@@ -323,7 +355,6 @@ Niente claim esagerati o linguaggio promozionale eccessivo.
         except Exception as e:
             print(f"[WARN] OpenAI non disponibile: {e}")
 
-    # fallback: paragrafo + bullet
     title_h = html.escape(title or "Prodotto moda")
     vendor_h = html.escape(vendor or "")
     ptype_h = html.escape(ptype or "Abbigliamento")
@@ -350,195 +381,171 @@ def main():
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[DEBUG] Fonte immagini: {fonte}")
         if ALLOWED_IDS:
-            print(f"[DEBUG] PRODUCT_IDS filter attivo: {', '.join(ALLOWED_IDS)}")
+            print(f"[DEBUG] PRODUCT_IDS attivi: {', '.join(ALLOWED_IDS)}")
 
-    processed = 0       # prodotti aggiornati (desc e/o img)
-    scanned = 0         # prodotti visti (in bozza)
-    skipped = 0         # saltati (avevano già contenuti / fuori filtro / problemi)
-    cursor = None
-    results = []        # per report CSV
+    processed = 0
+    scanned = 0
+    skipped = 0
+    results = []
 
-    while True:
+    # === SORGENTE PRODOTTI ===
+    if ALLOWED_IDS:
+        # prendi ESATTAMENTE questi prodotti
+        edges = fetch_products_by_ids(ALLOWED_IDS)
+        has_next = False
+    else:
+        # fallback: sfoglia bozze
+        data = fetch_draft_products(limit=50, cursor=None)
+        edges = safe_get(data, "products", "edges", default=[]) or []
+        has_next = safe_get(data, "products", "pageInfo", "hasNextPage", default=False)
+
+    for e in edges:
+        if (processed + skipped) >= MAX_PRODUCTS:
+            break
+
+        n = e.get("node") or {}
+        scanned += 1
+        notes = []
+        desc_updated = False
+        uploaded = 0
+
         try:
-            data = fetch_draft_products(limit=50, cursor=cursor)
-        except Exception as e:
-            print(f"[ERROR fetch_draft_products] {e}")
-            break
+            pid_num = product_id_from_gid(n["id"])
+            title  = safe_strip(n.get("title"))
+            vendor = safe_strip(n.get("vendor"))
+            ptype  = safe_strip(n.get("productType"))
+            ean    = first_barcode(n.get("variants"))
 
-        products = safe_get(data, "products", default={})
-        edges = products.get("edges", []) or []
-        page_info = products.get("pageInfo", {}) or {}
-        cursor = page_info.get("endCursor")
-        has_next = bool(page_info.get("hasNextPage"))
-
-        if not edges:
-            if scanned == 0:
-                print("Nessun prodotto in Bozza trovato.")
-            break
-
-        for e in edges:
-            if (processed + skipped) >= MAX_PRODUCTS:
-                break
-
-            n = e.get("node") or {}
-            scanned += 1
-            notes = []
-            desc_updated = False
-            uploaded = 0
-
-            try:
-                pid_num = product_id_from_gid(n["id"])
-
-                # --- filtro per PRODUCT_IDS (se impostato) ---
-                if ALLOWED_IDS and str(pid_num) not in ALLOWED_IDS:
-                    skipped += 1
-                    results.append({
-                        "product_id": pid_num,
-                        "title": safe_strip(n.get("title")),
-                        "vendor": safe_strip(n.get("vendor")),
-                        "ean": first_barcode(n.get("variants")),
-                        "images_uploaded": 0,
-                        "description_updated": False,
-                        "notes": "skip: fuori da PRODUCT_IDS"
-                    })
-                    continue
-
-                # --- stato contenuti (robusto a None) ---
-                img_edges = safe_get(n, "images", "edges", default=[]) or []
-                has_img   = len(img_edges) > 0
-                body_html = safe_strip(n.get("bodyHtml"))
-                has_desc  = bool(body_html)
-
-                if has_img or has_desc:
-                    title  = safe_strip(n.get("title"))
-                    vendor = safe_strip(n.get("vendor"))
-                    ean    = first_barcode(n.get("variants"))
-                    why = []
-                    if has_img:  why.append("ha già immagini")
-                    if has_desc: why.append("ha già descrizione")
-                    print(product_header(title, vendor, ean) + " - SKIP: " + ", ".join(why))
-                    skipped += 1
-                    results.append({
-                        "product_id": pid_num,
-                        "title": title, "vendor": vendor, "ean": ean,
-                        "images_uploaded": 0, "description_updated": False,
-                        "notes": "skip: " + ", ".join(why)
-                    })
-                    continue
-
-                # --- campi principali ---
-                title  = safe_strip(n.get("title"))
-                vendor = safe_strip(n.get("vendor"))
-                ptype  = safe_strip(n.get("productType"))
-                ean    = first_barcode(n.get("variants"))
-                if not title:
-                    skipped += 1
-                    print("[PROCESS] SKIP: titolo mancante")
-                    results.append({
-                        "product_id": pid_num,
-                        "title": "", "vendor": vendor, "ean": ean,
-                        "images_uploaded": 0, "description_updated": False,
-                        "notes": "skip: titolo mancante"
-                    })
-                    continue
-
-                print(product_header(title, vendor, ean))
-
-                # --- DESCRIZIONE ---
-                if USE_SHOPIFY_MAGIC_ONLY:
-                    try:
-                        set_product_metafield_gql(n["id"], "ai_flags", "needs_description", "true")
-                        notes.append("flag Magic impostato")
-                        print("  - Flag impostato: ai_flags.needs_description=true (usa Shopify Magic dall’Admin)")
-                    except Exception as ex:
-                        notes.append(f"flag Magic errore: {ex}")
-                        print(f"  - ERRORE flag Magic: {ex}")
-                else:
-                    try:
-                        desc_html = gen_description_html(title, vendor, ptype, ean)
-                        update_description(pid_num, desc_html)
-                        desc_updated = True
-                        print("  - Descrizione aggiornata ✅")
-                    except Exception as ex:
-                        notes.append(f"descrizione errore: {ex}")
-                        print(f"  - ERRORE descrizione: {ex}")
-
-                # --- IMMAGINI (fino a 5, white background) ---
-                img_urls = []
-                if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
-                    base = " ".join([x for x in [vendor, title, "product"] if x]).strip()
-                    queries = []
-                    if ean:
-                        queries += [
-                            f"{base} {ean}",
-                            f"{vendor} {title} {ean} packshot",
-                            f"{vendor} {title} {ean} white background",
-                        ]
-                    queries += [
-                        base,
-                        f"{vendor} {title}".strip(),
-                        f"{vendor} {title} packshot".strip(),
-                        f"{vendor} {title} white background".strip(),
-                        f"{vendor} {title} studio".strip(),
-                        f"{vendor} {title} site:{(vendor or '').lower()}.com".strip(),
-                    ]
-
-                    candidates = collect_candidate_images(queries, vendor=vendor)
-                    img_urls = filter_and_select_images(candidates, vendor=vendor, want_n=MAX_IMAGES_PER_PRODUCT)
-
-                if img_urls:
-                    for u in img_urls:
-                        try:
-                            img_id = add_image(pid_num, u, alt_text=f"{vendor} {title}".strip())
-                            uploaded += 1
-                            print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
-                        except Exception as ex:
-                            notes.append(f"img errore: {ex}")
-                            print(f"  - ERRORE immagine: {ex}")
-                else:
-                    print("  - Nessuna immagine trovata per la query.")
-
-                # --- riepilogo per-prodotto / link Admin ---
-                if uploaded > 0:
-                    print(f"  - Immagini caricate: {uploaded} ✅")
-                else:
-                    print("  - Nessuna immagine trovata per la query.")
-                if desc_updated or uploaded > 0:
-                    print(f"  Admin: {ADMIN_URL_TEMPLATE.format(pid=pid_num)}")
-
-                # --- contatori & risultati ---
-                if desc_updated or uploaded > 0:
-                    processed += 1
-                else:
-                    skipped += 1
-
-                results.append({
-                    "product_id": pid_num,
-                    "title": title,
-                    "vendor": vendor,
-                    "ean": ean,
-                    "images_uploaded": uploaded,
-                    "description_updated": desc_updated,
-                    "notes": "; ".join(notes)
-                })
-
-            except Exception as ex:
+            # filtro "bozza" & contenuti
+            status = safe_strip(n.get("status"))
+            if status.lower() != "draft":
                 skipped += 1
-                notes.append(f"errore prodotto: {ex}")
-                print(f"[ERROR prodotto] {ex}")
-                traceback.print_exc()
+                print(product_header(title, vendor, ean) + " - SKIP: status non DRAFT")
                 results.append({
-                    "product_id": product_id_from_gid(n["id"]) if n.get("id") else "",
-                    "title": safe_strip(n.get("title")),
-                    "vendor": safe_strip(n.get("vendor")),
-                    "ean": first_barcode(n.get("variants")),
-                    "images_uploaded": 0,
-                    "description_updated": False,
-                    "notes": "; ".join(notes)
+                    "product_id": pid_num, "title": title, "vendor": vendor, "ean": ean,
+                    "images_uploaded": 0, "description_updated": False,
+                    "notes": "skip: status non DRAFT"
                 })
+                continue
 
-        if (processed + skipped) >= MAX_PRODUCTS or not has_next:
-            break
+            img_edges = safe_get(n, "images", "edges", default=[]) or []
+            has_img   = len(img_edges) > 0
+            body_html = safe_strip(n.get("bodyHtml"))
+            has_desc  = bool(body_html)
+
+            if has_img or has_desc:
+                why = []
+                if has_img:  why.append("ha già immagini")
+                if has_desc: why.append("ha già descrizione")
+                print(product_header(title, vendor, ean) + " - SKIP: " + ", ".join(why))
+                skipped += 1
+                results.append({
+                    "product_id": pid_num, "title": title, "vendor": vendor, "ean": ean,
+                    "images_uploaded": 0, "description_updated": False,
+                    "notes": "skip: " + ", ".join(why)
+                })
+                continue
+
+            if not title:
+                skipped += 1
+                print("[PROCESS] SKIP: titolo mancante")
+                results.append({
+                    "product_id": pid_num, "title": "", "vendor": vendor, "ean": ean,
+                    "images_uploaded": 0, "description_updated": False,
+                    "notes": "skip: titolo mancante"
+                })
+                continue
+
+            print(product_header(title, vendor, ean))
+
+            # --- DESCRIZIONE ---
+            if USE_SHOPIFY_MAGIC_ONLY:
+                try:
+                    set_product_metafield_gql(n["id"], "ai_flags", "needs_description", "true")
+                    notes.append("flag Magic impostato")
+                    print("  - Flag impostato: ai_flags.needs_description=true (usa Shopify Magic dall’Admin)")
+                except Exception as ex:
+                    notes.append(f"flag Magic errore: {ex}")
+                    print(f"  - ERRORE flag Magic: {ex}")
+            else:
+                try:
+                    desc_html = gen_description_html(title, vendor, ptype, ean)
+                    update_description(pid_num, desc_html)
+                    desc_updated = True
+                    print("  - Descrizione aggiornata ✅")
+                except Exception as ex:
+                    notes.append(f"descrizione errore: {ex}")
+                    print(f"  - ERRORE descrizione: {ex}")
+
+            # --- IMMAGINI ---
+            img_urls = []
+            if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
+                base = " ".join([x for x in [vendor, title, "product"] if x]).strip()
+                queries = []
+                if ean:
+                    queries += [
+                        f"{base} {ean}",
+                        f"{vendor} {title} {ean} packshot",
+                        f"{vendor} {title} {ean} white background",
+                    ]
+                queries += [
+                    base,
+                    f"{vendor} {title}".strip(),
+                    f"{vendor} {title} packshot".strip(),
+                    f"{vendor} {title} white background".strip(),
+                    f"{vendor} {title} studio".strip(),
+                    f"{vendor} {title} site:{(vendor or '').lower()}.com".strip(),
+                ]
+
+                candidates = collect_candidate_images(queries, vendor=vendor)
+                img_urls = filter_and_select_images(candidates, vendor=vendor, want_n=MAX_IMAGES_PER_PRODUCT)
+
+            if img_urls:
+                for u in img_urls:
+                    try:
+                        img_id = add_image(pid_num, u, alt_text=f"{vendor} {title}".strip())
+                        uploaded += 1
+                        print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
+                    except Exception as ex:
+                        notes.append(f"img errore: {ex}")
+                        print(f"  - ERRORE immagine: {ex}")
+            else:
+                print("  - Nessuna immagine trovata per la query.")
+
+            # riepilogo/link
+            if uploaded > 0:
+                print(f"  - Immagini caricate: {uploaded} ✅")
+            else:
+                print("  - Nessuna immagine trovata per la query.")
+            if desc_updated or uploaded > 0:
+                print(f"  Admin: {ADMIN_URL_TEMPLATE.format(pid=pid_num)}")
+
+            # contatori & report
+            if desc_updated or uploaded > 0:
+                processed += 1
+            else:
+                skipped += 1
+
+            results.append({
+                "product_id": pid_num, "title": title, "vendor": vendor, "ean": ean,
+                "images_uploaded": uploaded, "description_updated": desc_updated,
+                "notes": "; ".join(notes)
+            })
+
+        except Exception as ex:
+            skipped += 1
+            notes.append(f"errore prodotto: {ex}")
+            print(f"[ERROR prodotto] {ex}")
+            traceback.print_exc()
+            results.append({
+                "product_id": product_id_from_gid(n.get("id","gid://shopify/Product/0")),
+                "title": safe_strip(n.get("title")),
+                "vendor": safe_strip(n.get("vendor")),
+                "ean": first_barcode(n.get("variants")),
+                "images_uploaded": 0,
+                "description_updated": False,
+                "notes": "; ".join(notes)
+            })
 
     # --- REPORT CSV ---
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -568,7 +575,7 @@ if __name__ == "__main__":
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
         if ALLOWED_IDS:
-            print(f"[INFO] Filtrando SOLO questi PRODUCT_IDS: {', '.join(ALLOWED_IDS)}")
+            print(f"[INFO] Processando ESATTAMENTE questi PRODUCT_IDS: {', '.join(ALLOWED_IDS)}")
         main()
         sys.exit(0)
     except Exception as e:
