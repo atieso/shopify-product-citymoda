@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v7d"
+VERSION = "2025-09-19-v7e"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -39,6 +39,9 @@ MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES", "3500000"))  # ~3.5MB
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ADMIN_URL_TEMPLATE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/products/{{pid}}"
+
+# Filtro opzionale: solo questi product IDs (numerici) separati da virgola nel .env
+ALLOWED_IDS = [x.strip() for x in os.getenv("PRODUCT_IDS", "").split(",") if x.strip()]
 
 # ========= UTILS =========
 def safe_get(d, *path, default=None):
@@ -346,10 +349,12 @@ def main():
         print(f"[DEBUG] Store={SHOPIFY_STORE_DOMAIN} | APIv={SHOPIFY_API_VERSION} | MagicOnly={USE_SHOPIFY_MAGIC_ONLY} | MaxProducts={MAX_PRODUCTS} | MaxImages={MAX_IMAGES_PER_PRODUCT}")
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[DEBUG] Fonte immagini: {fonte}")
+        if ALLOWED_IDS:
+            print(f"[DEBUG] PRODUCT_IDS filter attivo: {', '.join(ALLOWED_IDS)}")
 
     processed = 0       # prodotti aggiornati (desc e/o img)
     scanned = 0         # prodotti visti (in bozza)
-    skipped = 0         # saltati (avevano già contenuti / problemi)
+    skipped = 0         # saltati (avevano già contenuti / fuori filtro / problemi)
     cursor = None
     results = []        # per report CSV
 
@@ -382,6 +387,22 @@ def main():
             uploaded = 0
 
             try:
+                pid_num = product_id_from_gid(n["id"])
+
+                # --- filtro per PRODUCT_IDS (se impostato) ---
+                if ALLOWED_IDS and str(pid_num) not in ALLOWED_IDS:
+                    skipped += 1
+                    results.append({
+                        "product_id": pid_num,
+                        "title": safe_strip(n.get("title")),
+                        "vendor": safe_strip(n.get("vendor")),
+                        "ean": first_barcode(n.get("variants")),
+                        "images_uploaded": 0,
+                        "description_updated": False,
+                        "notes": "skip: fuori da PRODUCT_IDS"
+                    })
+                    continue
+
                 # --- stato contenuti (robusto a None) ---
                 img_edges = safe_get(n, "images", "edges", default=[]) or []
                 has_img   = len(img_edges) > 0
@@ -398,7 +419,7 @@ def main():
                     print(product_header(title, vendor, ean) + " - SKIP: " + ", ".join(why))
                     skipped += 1
                     results.append({
-                        "product_id": product_id_from_gid(n["id"]),
+                        "product_id": pid_num,
                         "title": title, "vendor": vendor, "ean": ean,
                         "images_uploaded": 0, "description_updated": False,
                         "notes": "skip: " + ", ".join(why)
@@ -414,14 +435,13 @@ def main():
                     skipped += 1
                     print("[PROCESS] SKIP: titolo mancante")
                     results.append({
-                        "product_id": product_id_from_gid(n["id"]),
+                        "product_id": pid_num,
                         "title": "", "vendor": vendor, "ean": ean,
                         "images_uploaded": 0, "description_updated": False,
                         "notes": "skip: titolo mancante"
                     })
                     continue
 
-                pid_num = product_id_from_gid(n["id"])
                 print(product_header(title, vendor, ean))
 
                 # --- DESCRIZIONE ---
@@ -478,7 +498,7 @@ def main():
                 else:
                     print("  - Nessuna immagine trovata per la query.")
 
-                # --- riepilogo per-prodotto nello stile richiesto ---
+                # --- riepilogo per-prodotto / link Admin ---
                 if uploaded > 0:
                     print(f"  - Immagini caricate: {uploaded} ✅")
                 else:
@@ -547,6 +567,8 @@ if __name__ == "__main__":
         print(f"[INFO] Using store: {SHOPIFY_STORE_DOMAIN}")
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
+        if ALLOWED_IDS:
+            print(f"[INFO] Filtrando SOLO questi PRODUCT_IDS: {', '.join(ALLOWED_IDS)}")
         main()
         sys.exit(0)
     except Exception as e:
