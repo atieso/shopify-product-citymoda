@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v7f"
+VERSION = "2025-09-19-v7g"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -11,35 +11,33 @@ SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "city-tre-srl.myshopify
 SHOPIFY_API_VERSION  = os.getenv("SHOPIFY_API_VERSION", "2025-01")
 SHOPIFY_ADMIN_TOKEN  = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
 
-# Fonti immagini (usa Google e/o Bing; va bene anche solo una)
+# Fonti immagini
 BING_IMAGE_KEY       = os.getenv("BING_IMAGE_KEY", "")
 GOOGLE_CSE_KEY       = os.getenv("GOOGLE_CSE_KEY", "")
 GOOGLE_CSE_CX        = os.getenv("GOOGLE_CSE_CX", "")
 
-# Descrizioni (se NON usi Shopify Magic)
+# Descrizioni
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 USE_SHOPIFY_MAGIC_ONLY = os.getenv("USE_SHOPIFY_MAGIC_ONLY", "false").lower() == "true"
 
-# Immagini (hard cap = 5)
+# Immagini (cap 5)
 MAX_IMAGES_PER_PRODUCT = min(int(os.getenv("MAX_IMAGES_PER_PRODUCT", "5")), 5)
 MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
 
-# Preferenze selezione immagini
 SAFE_DOMAINS_HINTS   = ["cdn", "images", "media", "static", "assets", "content", "img", "cloudfront", "akamaized"]
 WHITE_BG_KEYWORDS    = ["white", "bianco", "packshot", "studio", "product", "plain"]
 BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST", "").split(",") if d.strip()]
 
-# Controllo sfondo bianco & download
 WHITE_BG_BORDER_PCT  = float(os.getenv("WHITE_BG_BORDER_PCT", "0.12"))
 WHITE_BG_THRESHOLD   = int(os.getenv("WHITE_BG_THRESHOLD", "242"))
 WHITE_BG_MIN_RATIO   = float(os.getenv("WHITE_BG_MIN_RATIO", "0.82"))
 DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "7"))
-MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES", "3500000"))  # ~3.5MB
+MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES", "3500000"))
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ADMIN_URL_TEMPLATE = f"https://{SHOPIFY_STORE_DOMAIN}/admin/products/{{pid}}"
 
-# Filtro opzionale: processa SOLO questi ID numerici
+# Filtro opzionale: solo questi ID (product o variant)
 ALLOWED_IDS = [x.strip() for x in os.getenv("PRODUCT_IDS", "").split(",") if x.strip()]
 
 # ========= UTILS =========
@@ -61,22 +59,12 @@ def safe_strip(v):
 def product_id_from_gid(gid: str) -> int:
     return int(str(gid).split("/")[-1])
 
-def gid_from_id(pid_num: int) -> str:
+def gid_from_product_id(pid_num: int) -> str:
     return f"gid://shopify/Product/{pid_num}"
 
-def first_barcode(variants):
-    edges = safe_get(variants, "edges", default=[]) or []
-    for edge in edges:
-        node = edge.get("node") or {}
-        bc = safe_strip(node.get("barcode"))
-        if bc:
-            return bc
-    return ""
-
-def domain(url):
+def domain(u):
     try:
-        from urllib.parse import urlparse as _up
-        return _up(url).netloc.lower()
+        return urlparse(u).netloc.lower()
     except Exception:
         return ""
 
@@ -91,6 +79,15 @@ def score_image_url(u, vendor=""):
     if any(bad in d for bad in ["ebay.", "aliexpress.", "pinterest.", "facebook.", "tumblr.", "wordpress.", "blogspot."]): score += 3
     return score
 
+def first_barcode(variants):
+    edges = safe_get(variants, "edges", default=[]) or []
+    for edge in edges:
+        node = edge.get("node") or {}
+        bc = safe_strip(node.get("barcode"))
+        if bc:
+            return bc
+    return ""
+
 def product_header(title, vendor, ean):
     return f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'}"
 
@@ -104,6 +101,13 @@ def shopify_graphql(query: str, variables=None):
     if "errors" in j:
         raise RuntimeError(j["errors"])
     return j["data"]
+
+def shopify_rest_get(path, params=None):
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}{path}"
+    h = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN}
+    r = requests.get(url, headers=h, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 def fetch_draft_products(limit=50, cursor=None):
     q = """
@@ -129,37 +133,72 @@ def fetch_draft_products(limit=50, cursor=None):
     """
     return shopify_graphql(q, {"first": limit, "after": cursor})
 
-def fetch_products_by_ids(id_list):
-    """GraphQL nodes(ids:[...]) per prendere esattamente i prodotti richiesti."""
-    if not id_list:
-        return []
-    out = []
-    batch = 50
+def fetch_products_by_ids_graphql(id_list):
+    """GraphQL nodes(ids:[gid://shopify/Product/<id>])"""
+    if not id_list: return []
     q = """
     query($ids:[ID!]!){
       nodes(ids:$ids){
         ... on Product {
-          id
-          title
-          vendor
-          productType
-          handle
-          status
-          bodyHtml
+          id title vendor productType handle status bodyHtml
           images(first:1){ edges{ node{ id } } }
-          variants(first:10){ edges{ node{ id sku barcode title barcode } } }
+          variants(first:10){ edges{ node{ id sku barcode title } } }
         }
       }
     }
     """
-    for i in range(0, len(id_list), batch):
-        ids_batch = [gid_from_id(int(x)) for x in id_list[i:i+batch]]
-        data = shopify_graphql(q, {"ids": ids_batch})
-        nodes = data.get("nodes") or []
-        # normalizza in "edges-like"
-        for n in nodes:
-            if n: out.append({"node": n})
+    gids = [gid_from_product_id(int(x)) for x in id_list]
+    data = shopify_graphql(q, {"ids": gids})
+    nodes = data.get("nodes") or []
+    out = []
+    for n in nodes:
+        if n:
+            out.append({"node": n})
     return out
+
+def fetch_products_by_ids_rest(id_list):
+    """REST /products.json?ids=... (comma-separated product IDs)"""
+    try:
+        ids_param = ",".join(str(int(x)) for x in id_list)
+        js = shopify_rest_get(f"/products.json", params={"ids": ids_param, "limit": 250})
+        prods = js.get("products", []) or []
+        edges = []
+        for p in prods:
+            # mappa REST -> nodi compatibili
+            node = {
+                "id": gid_from_product_id(int(p["id"])),
+                "title": p.get("title"),
+                "vendor": p.get("vendor"),
+                "productType": p.get("product_type"),
+                "handle": p.get("handle"),
+                "status": p.get("status"),
+                "bodyHtml": p.get("body_html"),
+                "images": {"edges": [{"node": {"id": im.get("id")}} for im in (p.get("images") or [])[:1]]},
+                "variants": {"edges": [{"node": {
+                    "id": v.get("id"),
+                    "sku": v.get("sku"),
+                    "barcode": v.get("barcode"),
+                    "title": v.get("title")
+                }} for v in (p.get("variants") or [])[:10]]}
+            }
+            edges.append({"node": node})
+        return edges
+    except Exception:
+        return []
+
+def resolve_product_ids_from_variant_ids(variant_ids):
+    """Dato un elenco di variant IDs numerici, ritorna la lista di product IDs (numerici)."""
+    resolved = []
+    for vid in variant_ids:
+        try:
+            js = shopify_rest_get(f"/variants/{int(vid)}.json")
+            v = js.get("variant", {})
+            pid = v.get("product_id")
+            if pid:
+                resolved.append(str(pid))
+        except Exception as e:
+            print(f"[WARN] variant {vid} non risolvibile: {e}")
+    return list(dict.fromkeys(resolved))  # unique, preserve order
 
 def add_image(product_id_num: int, image_src: str, alt_text: str=""):
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products/{product_id_num}/images.json"
@@ -192,7 +231,7 @@ def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value:
         raise RuntimeError(f"metafieldsSet errors: {errs}")
     return True
 
-# ========= IMAGE SEARCH =========
+# ========= IMAGE SEARCH/FILTER =========
 def bing_image_search(query: str, count=50, pages=2):
     if not BING_IMAGE_KEY: return []
     url = "https://api.bing.microsoft.com/v7.0/images/search"
@@ -202,8 +241,7 @@ def bing_image_search(query: str, count=50, pages=2):
         params = {
             "q": query, "safeSearch": "Moderate",
             "count": count, "offset": p * count,
-            "imageType": "Photo", "imageContent": "Product",
-            "license": "Any"
+            "imageType": "Photo", "imageContent": "Product", "license": "Any"
         }
         try:
             r = requests.get(url, headers=h, params=params, timeout=20)
@@ -239,7 +277,6 @@ def google_cse_image_search(query: str, per_page=10, pages=3):
             break
     return out
 
-# ========= IMAGE FILTERS (download, white-bg, dedup) =========
 def _download_bytes(url: str):
     try:
         with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SEC) as r:
@@ -258,7 +295,7 @@ def _download_bytes(url: str):
 
 def _ahash(img, hash_size=8):
     from PIL import Image
-    im = img.convert("L").resize((hash_size, hash_size), Image.BILINEAR)
+    im = img.convert("L"). resize((hash_size, hash_size), Image.BILINEAR)
     pixels = list(im.getdata())
     avg = sum(pixels) / len(pixels)
     bits = "".join("1" if p > avg else "0" for p in pixels)
@@ -268,45 +305,34 @@ def _is_white_bg(img):
     from PIL import Image
     im = img.convert("RGB")
     w, h = im.size
-    if w < 120 or h < 120:
-        return False
-    bw = int(w * WHITE_BG_BORDER_PCT)
-    bh = int(h * WHITE_BG_BORDER_PCT)
-    px = im.load()
-    white = 0
-    total = 0
-    thr = WHITE_BG_THRESHOLD
+    if w < 120 or h < 120: return False
+    bw = int(w * WHITE_BG_BORDER_PCT); bh = int(h * WHITE_BG_BORDER_PCT)
+    px = im.load(); white = 0; total = 0; thr = WHITE_BG_THRESHOLD
     for y in list(range(0, bh)) + list(range(h - bh, h)):
         for x in range(w):
             r, g, b = px[x, y]
-            if r >= thr and g >= thr and b >= thr:
-                white += 1
+            if r >= thr and g >= thr and b >= thr: white += 1
             total += 1
     for y in range(bh, h - bh):
         for x in list(range(0, bw)) + list(range(w - bw, w)):
             r, g, b = px[x, y]
-            if r >= thr and g >= thr and b >= thr:
-                white += 1
+            if r >= thr and g >= thr and b >= thr: white += 1
             total += 1
-    ratio = (white / max(1, total))
-    return ratio >= WHITE_BG_MIN_RATIO
+    return (white / max(1, total)) >= WHITE_BG_MIN_RATIO
 
 def collect_candidate_images(queries, vendor=""):
-    urls = []
-    seen = set()
+    urls, seen = [], set()
     for q in queries:
         g = google_cse_image_search(q, per_page=10, pages=3) if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else []
         b = bing_image_search(q, count=50, pages=2) if BING_IMAGE_KEY else []
         for u in (g + b):
             if not u or u in seen: continue
-            seen.add(u)
-            urls.append(u)
+            seen.add(u); urls.append(u)
     urls.sort(key=lambda u: score_image_url(u, vendor))
     return urls
 
 def filter_and_select_images(candidates, vendor="", want_n=5):
-    selected = []
-    seen_hashes = set()
+    selected, seen_hashes = [], set()
     for url in candidates:
         if len(selected) >= want_n: break
         data = _download_bytes(url)
@@ -324,7 +350,7 @@ def filter_and_select_images(candidates, vendor="", want_n=5):
             continue
     return selected
 
-# ========= DESCRIPTION (paragrafo + bullet) =========
+# ========= DESCRIPTION =========
 def gen_description_html(title: str, vendor: str, ptype: str, ean: str) -> str:
     prompt = f"""
 Scrivi una descrizione per un prodotto moda.
@@ -339,7 +365,6 @@ Formato:
 Output SOLO in HTML semplice usando <p> e <ul><li>.
 Niente claim esagerati o linguaggio promozionale eccessivo.
 """.strip()
-
     if OPENAI_API_KEY:
         try:
             resp = requests.post(
@@ -350,20 +375,17 @@ Niente claim esagerati o linguaggio promozionale eccessivo.
             )
             resp.raise_for_status()
             txt = resp.json().get("output_text", "").strip()
-            if txt:
-                return txt
+            if txt: return txt
         except Exception as e:
             print(f"[WARN] OpenAI non disponibile: {e}")
-
+    # fallback
     title_h = html.escape(title or "Prodotto moda")
     vendor_h = html.escape(vendor or "")
     ptype_h = html.escape(ptype or "Abbigliamento")
-    p = (
-        f"<p>{title_h}{(' di ' + vendor_h) if vendor_h else ''}: un capo {ptype_h.lower()} essenziale, "
-        f"pensato per l'uso quotidiano con attenzione a comfort e durata. "
-        f"Linee pulite e dettagli curati lo rendono facile da abbinare nelle diverse occasioni, "
-        f"dal lavoro al tempo libero.</p>"
-    )
+    p = (f"<p>{title_h}{(' di ' + vendor_h) if vendor_h else ''}: un capo {ptype_h.lower()} essenziale, "
+         f"pensato per l'uso quotidiano con attenzione a comfort e durata. "
+         f"Linee pulite e dettagli curati lo rendono facile da abbinare nelle diverse occasioni, "
+         f"dal lavoro al tempo libero.</p>")
     ul = "<ul>" + "".join([
         "<li>Materiali selezionati per comfort e resistenza</li>",
         "<li>Vestibilità equilibrata e facile da indossare</li>",
@@ -381,23 +403,32 @@ def main():
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[DEBUG] Fonte immagini: {fonte}")
         if ALLOWED_IDS:
-            print(f"[DEBUG] PRODUCT_IDS attivi: {', '.join(ALLOWED_IDS)}")
+            print(f"[DEBUG] PRODUCT_IDS ricevuti: {', '.join(ALLOWED_IDS)}")
 
     processed = 0
     scanned = 0
     skipped = 0
     results = []
 
-    # === SORGENTE PRODOTTI ===
+    # --- Sorgente prodotti
+    edges = []
     if ALLOWED_IDS:
-        # prendi ESATTAMENTE questi prodotti
-        edges = fetch_products_by_ids(ALLOWED_IDS)
-        has_next = False
+        # 1) prova GraphQL nodes
+        edges = fetch_products_by_ids_graphql(ALLOWED_IDS)
+        if not edges:
+            print("[INFO] GraphQL nodes non ha trovato prodotti; provo REST /products.json?ids=...")
+            edges = fetch_products_by_ids_rest(ALLOWED_IDS)
+        if not edges:
+            print("[INFO] Nessun product trovato via /products.json; provo a risolvere come VARIANT IDs...")
+            product_ids = resolve_product_ids_from_variant_ids(ALLOWED_IDS)
+            if product_ids:
+                print(f"[INFO] Variant IDs risolti in product IDs: {', '.join(product_ids)}")
+                edges = fetch_products_by_ids_rest(product_ids)
+            else:
+                print("[WARN] Nessun ID risolto. Controlla che PRODUCT_IDS contenga ID prodotto o variante validi.")
     else:
-        # fallback: sfoglia bozze
         data = fetch_draft_products(limit=50, cursor=None)
         edges = safe_get(data, "products", "edges", default=[]) or []
-        has_next = safe_get(data, "products", "pageInfo", "hasNextPage", default=False)
 
     for e in edges:
         if (processed + skipped) >= MAX_PRODUCTS:
@@ -416,9 +447,8 @@ def main():
             ptype  = safe_strip(n.get("productType"))
             ean    = first_barcode(n.get("variants"))
 
-            # filtro "bozza" & contenuti
             status = safe_strip(n.get("status"))
-            if status.lower() != "draft":
+            if status and status.lower() != "draft":
                 skipped += 1
                 print(product_header(title, vendor, ean) + " - SKIP: status non DRAFT")
                 results.append({
@@ -458,12 +488,12 @@ def main():
 
             print(product_header(title, vendor, ean))
 
-            # --- DESCRIZIONE ---
+            # DESCRIZIONE
             if USE_SHOPIFY_MAGIC_ONLY:
                 try:
                     set_product_metafield_gql(n["id"], "ai_flags", "needs_description", "true")
                     notes.append("flag Magic impostato")
-                    print("  - Flag impostato: ai_flags.needs_description=true (usa Shopify Magic dall’Admin)")
+                    print("  - Flag impostato: ai_flags.needs_description=true (usa Shopify Magic)")
                 except Exception as ex:
                     notes.append(f"flag Magic errore: {ex}")
                     print(f"  - ERRORE flag Magic: {ex}")
@@ -477,7 +507,7 @@ def main():
                     notes.append(f"descrizione errore: {ex}")
                     print(f"  - ERRORE descrizione: {ex}")
 
-            # --- IMMAGINI ---
+            # IMMAGINI (fino a 5, white bg)
             img_urls = []
             if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
                 base = " ".join([x for x in [vendor, title, "product"] if x]).strip()
@@ -496,7 +526,6 @@ def main():
                     f"{vendor} {title} studio".strip(),
                     f"{vendor} {title} site:{(vendor or '').lower()}.com".strip(),
                 ]
-
                 candidates = collect_candidate_images(queries, vendor=vendor)
                 img_urls = filter_and_select_images(candidates, vendor=vendor, want_n=MAX_IMAGES_PER_PRODUCT)
 
@@ -512,7 +541,6 @@ def main():
             else:
                 print("  - Nessuna immagine trovata per la query.")
 
-            # riepilogo/link
             if uploaded > 0:
                 print(f"  - Immagini caricate: {uploaded} ✅")
             else:
@@ -520,7 +548,6 @@ def main():
             if desc_updated or uploaded > 0:
                 print(f"  Admin: {ADMIN_URL_TEMPLATE.format(pid=pid_num)}")
 
-            # contatori & report
             if desc_updated or uploaded > 0:
                 processed += 1
             else:
@@ -538,16 +565,15 @@ def main():
             print(f"[ERROR prodotto] {ex}")
             traceback.print_exc()
             results.append({
-                "product_id": product_id_from_gid(n.get("id","gid://shopify/Product/0")),
-                "title": safe_strip(n.get("title")),
-                "vendor": safe_strip(n.get("vendor")),
-                "ean": first_barcode(n.get("variants")),
-                "images_uploaded": 0,
-                "description_updated": False,
+                "product_id": product_id_from_gid(n.get("id","gid://shopify/Product/0")) if n else "",
+                "title": safe_strip(n.get("title")) if n else "",
+                "vendor": safe_strip(n.get("vendor")) if n else "",
+                "ean": first_barcode(n.get("variants")) if n else "",
+                "images_uploaded": 0, "description_updated": False,
                 "notes": "; ".join(notes)
             })
 
-    # --- REPORT CSV ---
+    # REPORT CSV
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = f"report_autofill_{ts}.csv"
     try:
@@ -561,8 +587,7 @@ def main():
         with open(csv_path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
                 print(line.rstrip())
-                if i >= 10:
-                    break
+                if i >= 10: break
     except Exception as e:
         print(f"[REPORT ERROR] {e}")
 
@@ -575,7 +600,7 @@ if __name__ == "__main__":
         fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
         print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
         if ALLOWED_IDS:
-            print(f"[INFO] Processando ESATTAMENTE questi PRODUCT_IDS: {', '.join(ALLOWED_IDS)}")
+            print(f"[INFO] Processando questi IDs (product o variant): {', '.join(ALLOWED_IDS)}")
         main()
         sys.exit(0)
     except Exception as e:
