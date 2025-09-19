@@ -1,5 +1,1 @@
-requests
-python-dotenv
-Pillow
-beautifulsoup4
-lxml
+pip install requests python-dotenv pillow beautifulsoup4 lxml
