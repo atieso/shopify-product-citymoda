@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 
-VERSION = "2025-09-19-v6"
+VERSION = "2025-09-19-v7"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -20,7 +20,7 @@ GOOGLE_CSE_CX        = os.getenv("GOOGLE_CSE_CX", "")
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 USE_SHOPIFY_MAGIC_ONLY = os.getenv("USE_SHOPIFY_MAGIC_ONLY", "false").lower() == "true"
 
-# Quante immagini caricare per prodotto (hard cap = 5)
+# Immagini (hard cap = 5)
 MAX_IMAGES_PER_PRODUCT = min(int(os.getenv("MAX_IMAGES_PER_PRODUCT", "5")), 5)
 MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
 
@@ -29,6 +29,13 @@ SAFE_DOMAINS_HINTS   = ["cdn", "images", "media", "static", "assets", "content",
 WHITE_BG_KEYWORDS    = ["white", "bianco", "packshot", "studio", "product", "plain"]
 # opzionale: priorità a domini brand (csv): es. "guess.com,guess.eu,calvinklein.it"
 BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST", "").split(",") if d.strip()]
+
+# Controllo sfondo bianco & download
+WHITE_BG_BORDER_PCT  = float(os.getenv("WHITE_BG_BORDER_PCT", "0.12"))
+WHITE_BG_THRESHOLD   = int(os.getenv("WHITE_BG_THRESHOLD", "242"))
+WHITE_BG_MIN_RATIO   = float(os.getenv("WHITE_BG_MIN_RATIO", "0.82"))
+DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "7"))
+MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES", "3500000"))  # ~3.5MB
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
@@ -138,7 +145,7 @@ def update_description(product_id_num: int, body_html: str):
     return True
 
 def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value: str, mtype: str="single_line_text_field"):
-    """Crea/aggiorna un metafield sul prodotto via GraphQL metafieldsSet."""
+    """Crea/aggiorna un metafield sul prodotto via GraphQL metafieldsSet (namespace >= 3 char)."""
     mutation = """
     mutation SetMF($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
@@ -162,101 +169,157 @@ def set_product_metafield_gql(product_gid: str, namespace: str, key: str, value:
         raise RuntimeError(f"metafieldsSet errors: {errs}")
     return True
 
-# ========= IMAGE SEARCH =========
-def bing_image_search(query: str):
-    if not BING_IMAGE_KEY: return None
+# ========= IMAGE SEARCH (paginazione) =========
+def bing_image_search(query: str, count=50, pages=2):
+    if not BING_IMAGE_KEY: return []
     url = "https://api.bing.microsoft.com/v7.0/images/search"
     h = {"Ocp-Apim-Subscription-Key": BING_IMAGE_KEY}
-    params = {
-        "q": query,
-        "safeSearch": "Moderate",
-        "count": 30,
-        "imageType": "Photo",
-        "imageContent": "Product",
-        "license": "Any"
-    }
+    out = []
+    for p in range(pages):
+        params = {
+            "q": query,
+            "safeSearch": "Moderate",
+            "count": count,
+            "offset": p * count,
+            "imageType": "Photo",
+            "imageContent": "Product",
+            "license": "Any"
+        }
+        try:
+            r = requests.get(url, headers=h, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json().get("value", [])
+            out += [x.get("contentUrl") for x in data if x.get("contentUrl")]
+        except Exception as e:
+            print(f"[Bing ERROR] {e}")
+            break
+    return out
+
+def google_cse_image_search(query: str, per_page=10, pages=3):
+    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
+        return []
+    base = "https://www.googleapis.com/customsearch/v1"
+    out = []
+    for i in range(pages):
+        start = 1 + i * per_page
+        params = {
+            "key": GOOGLE_CSE_KEY,
+            "cx": GOOGLE_CSE_CX,
+            "q": query,
+            "searchType": "image",
+            "num": per_page,
+            "start": start,
+            "safe": "active",
+            "imgType": "photo",
+            "imgDominantColor": "white"
+        }
+        try:
+            r = requests.get(base, params=params, timeout=20)
+            if r.status_code >= 400:
+                try: print(f"[Google CSE ERROR {r.status_code}] {r.json()}")
+                except: print(f"[Google CSE ERROR {r.status_code}] {r.text}")
+                break
+            items = r.json().get("items", []) or []
+            out += [x.get("link") for x in items if x.get("link")]
+        except Exception as e:
+            print(f"[Google CSE EXCEPTION] {e}")
+            break
+    return out
+
+# ========= IMAGE FILTERS (download, white-bg, dedup) =========
+def _download_bytes(url: str):
     try:
-        r = requests.get(url, headers=h, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json().get("value", [])
-        return [x.get("contentUrl") for x in data if x.get("contentUrl")]
-    except Exception as e:
-        print(f"[Bing ERROR] {e}")
+        with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SEC) as r:
+            r.raise_for_status()
+            total = 0
+            chunks = []
+            for chunk in r.iter_content(8192):
+                if chunk:
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        return None
+                    chunks.append(chunk)
+            return b"".join(chunks)
+    except Exception:
         return None
 
-def google_cse_image_search(query: str):
-    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
-        return None
-    base = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": GOOGLE_CSE_KEY,
-        "cx": GOOGLE_CSE_CX,
-        "q": query,
-        "searchType": "image",
-        "num": 10,
-        "safe": "active",
-        "imgType": "photo",
-        "imgDominantColor": "white"  # privilegia sfondo bianco
-    }
-    try:
-        r = requests.get(base, params=params, timeout=20)
-        if r.status_code >= 400:
-            try:
-                print(f"[Google CSE ERROR {r.status_code}] {r.json()}")
-            except Exception:
-                print(f"[Google CSE ERROR {r.status_code}] {r.text}")
-            return None
-        items = r.json().get("items", [])
-        return [x.get("link") for x in items if x.get("link")]
-    except Exception as e:
-        print(f"[Google CSE EXCEPTION] {e}")
-        return None
+def _ahash(img, hash_size=8):
+    from PIL import Image
+    im = img.convert("L").resize((hash_size, hash_size), Image.BILINEAR)
+    pixels = list(im.getdata())
+    avg = sum(pixels) / len(pixels)
+    bits = "".join("1" if p > avg else "0" for p in pixels)
+    return bits
+
+def _is_white_bg(img):
+    from PIL import Image
+    im = img.convert("RGB")
+    w, h = im.size
+    if w < 120 or h < 120:
+        return False
+    bw = int(w * WHITE_BG_BORDER_PCT)
+    bh = int(h * WHITE_BG_BORDER_PCT)
+    px = im.load()
+    white = 0
+    total = 0
+    thr = WHITE_BG_THRESHOLD
+    # top & bottom
+    for y in list(range(0, bh)) + list(range(h - bh, h)):
+        for x in range(w):
+            r, g, b = px[x, y]
+            if r >= thr and g >= thr and b >= thr:
+                white += 1
+            total += 1
+    # left & right
+    for y in range(bh, h - bh):
+        for x in list(range(0, bw)) + list(range(w - bw, w)):
+            r, g, b = px[x, y]
+            if r >= thr and g >= thr and b >= thr:
+                white += 1
+            total += 1
+    ratio = (white / max(1, total))
+    return ratio >= WHITE_BG_MIN_RATIO
 
 def collect_candidate_images(queries, vendor=""):
-    """Raccoglie più URL, li ordina per qualità euristica e rimuove duplicati."""
     urls = []
     seen = set()
     for q in queries:
-        ulist = None
-        # Google prima (se disponibile), poi Bing
-        if GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
-            ulist = google_cse_image_search(q)
-        if (not ulist) and BING_IMAGE_KEY:
-            ulist = bing_image_search(q)
-        if not ulist:
-            continue
-        for u in ulist:
+        g = google_cse_image_search(q, per_page=10, pages=3) if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else []
+        b = bing_image_search(q, count=50, pages=2) if BING_IMAGE_KEY else []
+        for u in (g + b):
             if not u or u in seen:
                 continue
             seen.add(u)
             urls.append(u)
-
-    # Scoring & sort
     urls.sort(key=lambda u: score_image_url(u, vendor))
     return urls
 
-def pick_top_images(urls, vendor="", max_n=3):
-    """Seleziona fino a max_n immagini preferendo packshot/white e domini 'puliti'."""
-    if not urls:
-        return []
-    # già ordinate da collect_candidate_images
-    top = []
-    seen_domains = set()
-    for u in urls:
-        d = domain(u)
-        # evita 2 immagini dallo stesso dominio se possibile
-        if d in seen_domains and len(top) < max_n - 1:
-            continue
-        top.append(u)
-        seen_domains.add(d)
-        if len(top) >= max_n:
+def filter_and_select_images(candidates, vendor="", want_n=5):
+    selected = []
+    seen_hashes = set()
+    for url in candidates:
+        if len(selected) >= want_n:
             break
-    return top
+        data = _download_bytes(url)
+        if not data:
+            continue
+        try:
+            from PIL import Image
+            from io import BytesIO
+            img = Image.open(BytesIO(data))
+            if not _is_white_bg(img):
+                continue
+            h = _ahash(img)
+            if h in seen_hashes:
+                continue
+            seen_hashes.add(h)
+            selected.append(url)
+        except Exception:
+            continue
+    return selected
 
 # ========= DESCRIPTION (paragrafo + bullet) =========
 def gen_description_html(title: str, vendor: str, ptype: str, ean: str) -> str:
-    """Ritorna HTML con <p> iniziale + <ul> di bullet."""
-    # Se hai OPENAI_API_KEY, prova un testo un po' più ricco
     prompt = f"""
 Scrivi una descrizione per un prodotto moda.
 Dati:
@@ -286,19 +349,19 @@ Niente claim esagerati o linguaggio promozionale eccessivo.
         except Exception as e:
             print(f"[WARN] OpenAI non disponibile: {e}")
 
-    # Fallback semplice, garantendo paragrafo + bullet
+    # fallback: paragrafo + bullet
     title_h = html.escape(title or "Prodotto moda")
     vendor_h = html.escape(vendor or "")
     ptype_h = html.escape(ptype or "Abbigliamento")
     p = (
         f"<p>{title_h}{(' di ' + vendor_h) if vendor_h else ''}: un capo {ptype_h.lower()} essenziale, "
-        f"pensato per un utilizzo quotidiano con attenzione a comfort e durata. "
+        f"pensato per l'uso quotidiano con attenzione a comfort e durata. "
         f"Linee pulite e dettagli curati lo rendono facile da abbinare nelle diverse occasioni, "
         f"dal lavoro al tempo libero.</p>"
     )
     ul = "<ul>" + "".join([
         "<li>Materiali selezionati per comfort e resistenza</li>",
-        "<li>Vestibilità equilibrata, facile da indossare</li>",
+        "<li>Vestibilità equilibrata e facile da indossare</li>",
         "<li>Dettagli curati e finiture pulite</li>",
         "<li>Indicazioni di cura semplici</li>",
         "<li>Adatto a molteplici occasioni</li>",
@@ -357,16 +420,16 @@ def main():
                 vendor = safe_strip(n.get("vendor"))
                 ptype  = safe_strip(n.get("productType"))
                 ean    = first_barcode(n.get("variants"))
-                pid_num = product_id_from_gid(n["id"])
-
                 if not title:
                     notes.append("skip: titolo mancante")
+                    processed += 1
                     results.append({
-                        "product_id": pid_num, "title": "", "vendor": vendor, "ean": ean,
+                        "product_id": "", "title": "", "vendor": vendor, "ean": ean,
                         "images_uploaded": uploaded, "description_updated": desc_updated, "notes": "; ".join(notes)
                     })
                     continue
 
+                pid_num = product_id_from_gid(n["id"])
                 print(f"[PROCESS] {title} | brand={vendor or '-'} | ean={ean or '-'}")
 
                 # --- DESCRIZIONE ---
@@ -388,24 +451,29 @@ def main():
                         notes.append(f"descrizione errore: {ex}")
                         print(f"  - ERRORE descrizione: {ex}")
 
-                # --- IMMAGINI (fino a MAX_IMAGES_PER_PRODUCT, cap 5) ---
+                # --- IMMAGINI (fino a 5, white background) ---
                 img_urls = []
                 if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
                     base = " ".join([x for x in [vendor, title, "product"] if x]).strip()
                     queries = []
                     if ean:
-                        queries.append(f"{base} {ean}")
+                        queries += [
+                            f"{base} {ean}",
+                            f"{vendor} {title} {ean} packshot",
+                            f"{vendor} {title} {ean} white background",
+                        ]
                     queries += [
                         base,
                         f"{vendor} {title}".strip(),
                         f"{vendor} {title} packshot".strip(),
                         f"{vendor} {title} white background".strip(),
-                        f"{vendor} {title} lookbook".strip(),
+                        f"{vendor} {title} studio".strip(),
                         f"{vendor} {title} site:{(vendor or '').lower()}.com".strip(),
                     ]
 
                     candidates = collect_candidate_images(queries, vendor=vendor)
-                    img_urls = pick_top_images(candidates, vendor=vendor, max_n=MAX_IMAGES_PER_PRODUCT)
+                    # filtra & scegli fino a MAX_IMAGES_PER_PRODUCT (cap 5)
+                    img_urls = filter_and_select_images(candidates, vendor=vendor, want_n=MAX_IMAGES_PER_PRODUCT)
 
                 if img_urls:
                     for u in img_urls:
@@ -420,8 +488,8 @@ def main():
                         notes.append("nessuna immagine caricata (tutte fallite)")
                         print("  - Nessuna immagine caricata (tutte fallite).")
                 else:
-                    notes.append("nessuna immagine trovata")
-                    print("  - Nessuna immagine trovata per la query.")
+                    notes.append("nessuna immagine white-bg trovata")
+                    print("  - Nessuna immagine white-bg trovata per la query.")
 
                 processed += 1
 
@@ -429,6 +497,7 @@ def main():
                 notes.append(f"errore prodotto: {ex}")
                 print(f"[ERROR prodotto] {ex}")
                 traceback.print_exc()
+                processed += 1
 
             # append result row
             results.append({
@@ -437,3 +506,38 @@ def main():
                 "vendor": vendor if 'vendor' in locals() else "",
                 "ean": ean if 'ean' in locals() else "",
                 "images_uploaded": uploaded,
+                "description_updated": desc_updated,
+                "notes": "; ".join(notes)
+            })
+
+        if not has_next:
+            break
+
+    # --- REPORT CSV ---
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = f"report_autofill_{ts}.csv"
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["product_id","title","vendor","ean","images_uploaded","description_updated","notes"])
+            w.writeheader()
+            for row in results:
+                w.writerow(row)
+        print(f"[REPORT] Salvato: {csv_path}")
+    except Exception as e:
+        print(f"[REPORT ERROR] {e}")
+
+    print(f"Fatto. Prodotti processati: {processed}")
+
+# ========= ENTRYPOINT =========
+if __name__ == "__main__":
+    try:
+        print(f"[INFO] Using store: {SHOPIFY_STORE_DOMAIN}")
+        fonte = "Google" if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else ("Bing" if BING_IMAGE_KEY else "Nessuna")
+        print(f"[INFO] Fonte immagini: {fonte} | Max img/prodotto: {MAX_IMAGES_PER_PRODUCT}")
+        main()
+        sys.exit(0)
+    except Exception as e:
+        print("=== UNCAUGHT ERROR ===")
+        print(repr(e))
+        traceback.print_exc()
+        sys.exit(0)
