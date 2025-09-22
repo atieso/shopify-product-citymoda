@@ -4,7 +4,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-22-magic+imgs-v2"
+VERSION = "2025-09-22-magic+imgs-v3-strict"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -21,7 +21,10 @@ MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
 
 # Domini brand/retailer affidabili
 BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST","").split(",") if d.strip()]
-TRUSTED_RETAILER_DOMAINS = [d.strip().lower() for d in os.getenv("TRUSTED_RETAILER_DOMAINS","zalando.,aboutyou.,farfetch.,yoox.,ssense.,endclothing.,footlocker.,jdSports.,luisaviaroma.,zappos.,asap.,asos.,shopifycdn.com,cdn.shopify.com").split(",") if d.strip()]
+TRUSTED_RETAILER_DOMAINS = [d.strip().lower() for d in os.getenv(
+    "TRUSTED_RETAILER_DOMAINS",
+    "zalando.,aboutyou.,farfetch.,yoox.,ssense.,endclothing.,footlocker.,jdsports.,luisaviaroma.,zappos.,asos.,cdn.shopify.com,shopifycdn.com"
+).split(",") if d.strip()]
 
 DOMAINS_BLACKLIST = ["ebay.","aliexpress.","pinterest.","facebook.","tumblr.","wordpress.","blogspot.","vk.","tiktok.","twitter.","x.com","instagram."]
 SAFE_DOMAINS_HINTS= ["cdn","images","media","static","assets","content","img","cloudfront","akamaized"]
@@ -37,6 +40,20 @@ MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES","3500000"))
 STRICT_CODE_IMAGE_MATCH = os.getenv("STRICT_CODE_IMAGE_MATCH","true").lower()=="true"
 STRICT_CODE_DESC_ONLY   = os.getenv("STRICT_CODE_DESC_ONLY","true").lower()=="true"
 CONTEXT_FETCH_MAX       = int(os.getenv("CONTEXT_FETCH_MAX","300000"))
+
+# === Strictness & soglie (consigliato: lasciare i default severi) ===
+REQUIRE_BRAND_MATCH         = os.getenv("REQUIRE_BRAND_MATCH","true").lower()=="true"
+REQUIRE_CODE_IN_URL_OR_CTX  = os.getenv("REQUIRE_CODE_IN_URL_OR_CTX","true").lower()=="true"
+REQUIRE_TRUSTED_DOMAIN_IMG  = os.getenv("REQUIRE_TRUSTED_DOMAIN_IMG","true").lower()=="true"  # solo brand/retailer whitelist
+DESC_CONFIDENCE_THRESHOLD   = float(os.getenv("DESC_CONFIDENCE_THRESHOLD","0.80"))
+IMG_CONFIDENCE_THRESHOLD    = float(os.getenv("IMG_CONFIDENCE_THRESHOLD","0.85"))
+
+# Escludi immagini lifestyle/editorial
+REJECT_LIFESTYLE_HINTS      = os.getenv("REJECT_LIFESTYLE_HINTS","true").lower()=="true"
+LIFESTYLE_HINT_WORDS        = [w.strip().lower() for w in os.getenv(
+    "LIFESTYLE_HINT_WORDS",
+    "lookbook,campaign,street,editorial,model,runway,backstage,outfit"
+).split(",") if w.strip()]
 
 # Descrizioni / “Shopify Magic”
 WRITE_MAGIC_PROMPT_METAFIELD = os.getenv("WRITE_MAGIC_PROMPT_METAFIELD","true").lower()=="true"
@@ -112,7 +129,7 @@ def create_or_update_metafield(product_id_num:int, namespace:str, key:str, value
     }
     r = requests.post(url, json=payload, headers=h, timeout=30)
     if r.status_code == 422:
-        # Metafield esiste già -> prova update via GraphQL (lookup id)
+        # Metafield esiste già -> update via GraphQL
         q = """
         query($id:ID!){
           product(id:$id){
@@ -134,6 +151,16 @@ def create_or_update_metafield(product_id_num:int, namespace:str, key:str, value
                 return True
     r.raise_for_status()
     return True
+
+# === Helpers ===
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+def _brand_like(s):
+    return _norm(s)
+
+def _bool_score(ok, w): 
+    return w if ok else 0.0
 
 # === SKU helpers ===
 def sku_root(s: str) -> str:
@@ -322,7 +349,7 @@ def _download_bytes(url):
     except Exception:
         return None
 
-# === Image checks ===
+# === Image checks & parsing ===
 def _ahash(img, hash_size=8):
     from PIL import Image
     im=img.convert("L").resize((hash_size,hash_size),Image.BILINEAR)
@@ -337,7 +364,6 @@ def _is_white_bg(img):
     if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: return False
     bw=int(w*WHITE_BG_BORDER_PCT); bh=int(h*WHITE_BG_BORDER_PCT)
     px=im.load(); white=0; tot=0; thr=WHITE_BG_THRESHOLD
-    # bordi
     for y in list(range(0,bh))+list(range(h-bh,h)):
         for x in range(w):
             r,g,b=px[x,y]
@@ -360,8 +386,8 @@ def _extract_product_structured(text):
     try:
         soup=BeautifulSoup(text,"lxml")
         meta_title = (soup.title.string if soup.title else "") or ""
-        og_title = soup.find("meta",{"property":"og:title"})
-        og_title = og_title.get("content","") if og_title else ""
+        ogt = soup.find("meta",{"property":"og:title"})
+        og_title = ogt.get("content","") if ogt else ""
         candidates=[]
         for s in soup.find_all("script",{"type":"application/ld+json"}):
             try:
@@ -373,18 +399,18 @@ def _extract_product_structured(text):
         for d in candidates:
             if not isinstance(d, dict): continue
             t=d.get("@type")
-            if t=="Product" or (isinstance(t,list) and "Product" in t):
+            types = [t] if isinstance(t,str) else (t or [])
+            if "Product" in types:
                 prod.update(d)
         info={"title": prod.get("name") or og_title or meta_title,
               "brand": (prod.get("brand",{}) or {}).get("name") if isinstance(prod.get("brand"),dict) else prod.get("brand"),
-              "gtin13": prod.get("gtin13") or prod.get("gtin"),
+              "gtin13": prod.get("gtin13") or prod.get("gtin") or prod.get("gtin8") or prod.get("isbn"),
               "mpn": prod.get("mpn"), "sku": prod.get("sku"),
               "color": prod.get("color"), "material": prod.get("material")}
-        # hints
         specs={}
-        for th in soup.find_all(["th","td","li","p","span","div"]):
-            t=(th.get_text(" ",strip=True) or "").lower()
-            if ("composizione" in t or "material" in t) and "100%" in t or "cotone" in t or "poliest" in t: specs["material_hint"]=t
+        for el in soup.find_all(["th","td","li","p","span","div"]):
+            t=(el.get_text(" ",strip=True) or "").lower()
+            if "composizione" in t or "material" in t: specs["material_hint"]=t
             if "colore" in t or "color" in t: specs["color_hint"]=t
             if "maniche" in t or "sleeve" in t: specs["sleeve_hint"]=t
         info["specs"]=specs
@@ -392,21 +418,73 @@ def _extract_product_structured(text):
     except Exception:
         return {}
 
-def _brand_like(s):
-    return (s or "").lower().replace(" ","").replace("-","")
+def _brand_domain_like(vendor, d):
+    return _brand_like(vendor) in d.replace(".","")
 
-# === Candidates & filters ===
+# === Candidates & filters (ranking) ===
 def score_image_url(u,vendor=""):
     d=domain(u or ""); s=0
-    # prefer brand domains poi retailer affidabili
     if any(wh in d for wh in BRAND_DOMAINS_WHITELIST if wh): s-=8
     if any(wh in d for wh in TRUSTED_RETAILER_DOMAINS if wh): s-=5
-    if vendor and _brand_like(vendor) in d.replace(".",""): s-=3
+    if vendor and _brand_domain_like(vendor, d): s-=3
     if any(h in d for h in SAFE_DOMAINS_HINTS): s-=1
     if any(k in (u or "").lower() for k in WHITE_BG_KEYWORDS): s-=1
     if any(b in d for b in DOMAINS_BLACKLIST): s+=10
     return s
 
+def _is_lifestyle_url_or_ctx(url, ctx):
+    u=(url or "").lower(); c=(ctx or "").lower()
+    if any(w in u for w in LIFESTYLE_HINT_WORDS): return True
+    if any(w in c for w in LIFESTYLE_HINT_WORDS): return True
+    return False
+
+# === Confidence models ===
+def _desc_confidence(vendor, code, info, page_domain, page_text):
+    brand_page = _brand_like(safe_strip(info.get("brand")))
+    brand_prod = _brand_like(vendor)
+    brand_match = bool(brand_page) and brand_page==brand_prod
+    brand_in_domain = bool(brand_prod) and (brand_prod in page_domain.replace(".",""))
+    code_in_struct = any((safe_strip(info.get(k)) or "").lower()==(code or "").lower() for k in ["sku","mpn","gtin13","gtin"])
+    code_in_text = _context_has_code(page_text, code)
+
+    s = 0.0
+    s += _bool_score(code_in_struct, 0.5)
+    s += _bool_score(code_in_text,   0.3)
+    s += _bool_score(brand_match,    0.3)
+    s += _bool_score(brand_in_domain,0.2)
+
+    if REQUIRE_BRAND_MATCH and not (brand_match or brand_in_domain):
+        return 0.0
+    if REQUIRE_CODE_IN_URL_OR_CTX and not (code_in_struct or code_in_text):
+        return 0.0
+    return min(s,1.0)
+
+def _img_confidence(vendor, code, url, ctx, page_text, info):
+    d=domain(ctx or url)
+    brand_ok = _brand_like(safe_strip(info.get("brand"))) == _brand_like(vendor)
+    brand_in_domain = _brand_domain_like(vendor, d)
+    code_in_url = (code or "").lower() in (url or "").lower()
+    code_in_struct = any((safe_strip(info.get(k)) or "").lower()==(code or "").lower() for k in ["sku","mpn","gtin13","gtin"])
+    code_in_text = _context_has_code(page_text, code)
+
+    s = 0.0
+    s += _bool_score(code_in_url,        0.35)
+    s += _bool_score(code_in_struct,     0.35)
+    s += _bool_score(code_in_text,       0.20)
+    s += _bool_score(brand_ok,           0.25)
+    s += _bool_score(brand_in_domain,    0.20)
+    if any(w in d for w in BRAND_DOMAINS_WHITELIST): s += 0.25
+    elif any(w in d for w in TRUSTED_RETAILER_DOMAINS): s += 0.15
+
+    if REQUIRE_TRUSTED_DOMAIN_IMG and not (any(w in d for w in BRAND_DOMAINS_WHITELIST) or any(w in d for w in TRUSTED_RETAILER_DOMAINS)):
+        return 0.0
+    if REQUIRE_BRAND_MATCH and not (brand_ok or brand_in_domain):
+        return 0.0
+    if REQUIRE_CODE_IN_URL_OR_CTX and not (code_in_url or code_in_struct or code_in_text):
+        return 0.0
+    return min(s, 1.0)
+
+# === Search wrappers ===
 def collect_candidate_images(queries, vendor="", code=""):
     items=[]; seen=set()
     for q in queries:
@@ -417,65 +495,61 @@ def collect_candidate_images(queries, vendor="", code=""):
             if not c or c in seen: continue
             d=domain(c)
             if any(bad in d for bad in DOMAINS_BLACKLIST): continue
-            # Estensioni immagine note
-            if not re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", c, re.I): 
-                # spesso funzionano lo stesso, ma penalizza
-                pass
             seen.add(c); items.append({"content":c,"context":ctx})
-    # sorting per domini
     items.sort(key=lambda it: score_image_url(it["content"], vendor))
-    # Validazione forte su codice e brand
-    if code and STRICT_CODE_IMAGE_MATCH:
-        filtered=[]
-        for it in items:
-            url=(it["content"] or "")
-            if code.lower() in url.lower():
-                filtered.append(it); continue
-            ctx=it.get("context")
-            if not ctx: continue
-            txt=_http_get_text(ctx, limit_bytes=CONTEXT_FETCH_MAX)
-            if not txt: continue
-            info=_extract_product_structured(txt)
-            brand_ok = (safe_strip(info.get("brand")) and _brand_like(safe_strip(info.get("brand")))==_brand_like(vendor)) or (_brand_like(vendor) in domain(ctx).replace(".",""))
-            code_ok  = _context_has_code(txt, code) or any((safe_strip(info.get(k)) or "").lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"])
-            if code_ok and (brand_ok or any(w in domain(ctx) for w in BRAND_DOMAINS_WHITELIST+TRUSTED_RETAILER_DOMAINS)):
-                filtered.append(it); continue
-        items=filtered
     return items
 
-def filter_and_select_images(candidates, vendor="", title="", want_n=5):
+def filter_and_select_images(candidates, vendor="", title="", code="", want_n=5):
     from PIL import Image
     selected=[]; seen_hash=[]
-    tokens=[t.lower() for t in re.findall(r"[a-z0-9]+",(title or "")) if len(t)>3][:4]
+
     for it in candidates:
         if len(selected)>=want_n: break
-        url=it["content"]; ctx=(it.get("context") or "").lower()
-        d=domain(url)
-        penalty=0
-        # dominio: se non brand/retailer attendibile e non contiene token titolo => penalizza
-        if (BRAND_DOMAINS_WHITELIST or TRUSTED_RETAILER_DOMAINS) and not any(w in d for w in BRAND_DOMAINS_WHITELIST+TRUSTED_RETAILER_DOMAINS):
-            penalty+=1
-        if tokens and ctx and not any(t in ctx for t in tokens):
-            penalty+=1
-        if penalty>=2: 
+        url=it["content"]; ctx=it.get("context") or url
+
+        # lifestyle hints
+        if REJECT_LIFESTYLE_HINTS and _is_lifestyle_url_or_ctx(url, ctx):
             continue
+
+        # tenta HEAD per MIME (tollerante)
+        try:
+            r1=requests.head(url, timeout=8, allow_redirects=True)
+            ct=r1.headers.get("Content-Type","").lower()
+            if "image" not in ct and not re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", url, re.I):
+                # alcuni server non impostano correttamente il MIME, quindi non scartiamo solo per questo
+                pass
+        except:
+            pass
+
         data=_download_bytes(url)
         if not data: 
             continue
+
+        page_txt = _http_get_text(ctx, limit_bytes=CONTEXT_FETCH_MAX) if ctx else ""
+        info = _extract_product_structured(page_txt) if page_txt else {}
+
+        conf = _img_confidence(vendor, code, url, ctx, page_txt, info)
+        if conf < IMG_CONFIDENCE_THRESHOLD:
+            continue
+
         try:
             from io import BytesIO
             img=Image.open(BytesIO(data))
-            # dimensione e fondo bianco
+            w,h=img.size
+            if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: 
+                continue
             if not _is_white_bg(img): 
                 continue
-            h=_ahash(img)
-            if any(_hamming(h, prev)<=5 for prev in seen_hash):
+            hcode=_ahash(img)
+            if any(_hamming(hcode, prev)<=5 for prev in seen_hash):
                 continue
-            seen_hash.append(h)
-            selected.append(url)
+            seen_hash.append(hcode)
+            selected.append((url, conf))
         except Exception:
             continue
-    return selected
+
+    selected.sort(key=lambda t: t[1], reverse=True)
+    return [u for (u,_) in selected]
 
 # === Descrizioni (Shopify Magic style) ===
 def magic_prompt_for_sku(sku: str) -> str:
@@ -483,18 +557,18 @@ def magic_prompt_for_sku(sku: str) -> str:
     return f"descrivi prodotto {sku} in italiano, con prima parte emozionale e seconda parte Bullet Point"
 
 def build_magic_style_description(title, vendor, ptype, code, info):
-    """1 paragrafo emozionale + elenco puntato. Usa indizi da schema.org/hints."""
     title_src = safe_strip(info.get("title")) or title
     brand_src = safe_strip(info.get("brand")) or vendor
     color     = safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
     material  = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
     sleeve    = safe_strip(safe_get(info,"specs","sleeve_hint") or "")
-    # Intro emozionale
+
     name_bits = []
     if ptype: name_bits.append(ptype)
     if title_src and (not ptype or title_src.lower() not in (ptype or "").lower()):
         name_bits.append(title_src)
     display_name = " ".join(name_bits) or (title or "Capo")
+
     emo = f"Indossa {html.escape(display_name)}"
     if brand_src: emo += f" di {html.escape(brand_src)}"
     emo += " e scopri un equilibrio perfetto tra stile e comfort quotidiano."
@@ -520,32 +594,33 @@ def build_magic_style_description(title, vendor, ptype, code, info):
     return emo_par + ul
 
 def gen_description_from_sources_magic_format(title, vendor, ptype, code):
-    """Cerca una pagina attendibile con il codice; se trovata usa info per arricchire.
-       In ogni caso restituisce HTML in formato Magic (intro + bullets)."""
     queries=[f"\"{code}\"", f"{vendor} {code}", f"{title} {code}"]
-    pages=[]
+    best=None
     for q in queries:
         items=google_cse_web_search(q, num=8)
         for it in items:
-            link=it.get("link"); d=domain(link)
+            link=it.get("link")
+            d=domain(link)
             if not link: continue
             if any(b in d for b in DOMAINS_BLACKLIST): continue
             txt=_http_get_text(link, limit_bytes=CONTEXT_FETCH_MAX)
             if not txt: continue
             info=_extract_product_structured(txt)
-            ok=_context_has_code(txt, code) or any((safe_strip(info.get(k)) or "").lower()==code.lower() for k in ["sku","mpn","gtin13","gtin"])
-            brand_ok = not vendor or (safe_strip(info.get("brand")) and _brand_like(safe_strip(info.get("brand")))==_brand_like(vendor)) or (_brand_like(vendor) in d.replace(".",""))
-            if ok and brand_ok:
-                pages.append((link,info))
-        if pages: break
-    if pages:
-        link, info = pages[0]
+            conf=_desc_confidence(vendor, code, info, d, txt)
+            if conf>=DESC_CONFIDENCE_THRESHOLD:
+                best=(link, info, conf)
+                break
+        if best: break
+
+    if best:
+        link, info, conf = best
         desc_html = build_magic_style_description(title, vendor, ptype, code, info)
-        return desc_html, link
-    # fallback senza fonte certa
+        return desc_html, link, conf
+
+    # fallback “sicuro”: testo generico in formato Magic, conf 0.0 (non verrà scritto se la soglia > 0)
     info={}
     desc_html = build_magic_style_description(title, vendor, ptype, code, info)
-    return desc_html, None
+    return desc_html, None, 0.0
 
 # === Report ===
 def row(pid, title, vendor, code, uploaded, desc_updated, notes, context_url="", image_urls=""):
@@ -660,21 +735,19 @@ def main():
                 except Exception as ex:
                     print(f"  - ERRORE metafield Magic: {ex}")
 
-            # ----- DESCRIZIONE (formato Magic: intro emozionale + bullets)
-            desc_updated=False; used_context_url=""
+            # ----- DESCRIZIONE (intro emozionale + bullets) con soglia confidenza
+            desc_updated=False; used_context_url=""; desc_conf=0.0
             desc_html=""; ctx=None
             if code_for_search:
-                desc_html, ctx = gen_description_from_sources_magic_format(title, vendor, ptype, code_for_search)
-            if not desc_html and not STRICT_CODE_DESC_ONLY:
-                # fallback estremo (non dovremmo arrivarci)
-                desc_html = build_magic_style_description(title, vendor, ptype, code_for_search, {})
-            if desc_html:
-                update_description(pid, desc_html); desc_updated=True; print("  - Descrizione aggiornata (formato Magic) ✅")
+                desc_html, ctx, desc_conf = gen_description_from_sources_magic_format(title, vendor, ptype, code_for_search)
+
+            if desc_conf >= DESC_CONFIDENCE_THRESHOLD and desc_html:
+                update_description(pid, desc_html); desc_updated=True; print(f"  - Descrizione aggiornata (conf={desc_conf:.2f}) ✅")
                 if ctx: used_context_url=ctx; print(f"    • Fonte: {ctx}")
             else:
-                print("  - Nessuna pagina affidabile con il codice: descrizione NON aggiornata")
+                print(f"  - Descrizione NON aggiornata (conf={desc_conf:.2f} < {DESC_CONFIDENCE_THRESHOLD})")
 
-            # ----- IMMAGINI (selettore più severo e preciso)
+            # ----- IMMAGINI (selettore severo con soglia)
             uploaded=0; uploaded_urls=[]
             img_urls=[]
             if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
@@ -687,11 +760,10 @@ def main():
                         f"{title} {code_for_search} white background",
                         f"{vendor} {title} {code_for_search} white background",
                     ]
-                    # site: brand + retailer affidabili
                     q_img += [f"site:{d} {code_for_search}" for d in (BRAND_DOMAINS_WHITELIST+TRUSTED_RETAILER_DOMAINS)]
                 q_img += [f"{base} packshot", f"{base} white background"]
                 cands = collect_candidate_images(q_img, vendor=vendor, code=code_for_search)
-                img_urls = filter_and_select_images(cands, vendor=vendor, title=title, want_n=MAX_IMAGES_PER_PRODUCT)
+                img_urls = filter_and_select_images(cands, vendor=vendor, title=title, code=code_for_search, want_n=MAX_IMAGES_PER_PRODUCT)
 
             if img_urls:
                 for u in img_urls:
@@ -703,7 +775,7 @@ def main():
                         print(f"  - ERRORE immagine: {ex}")
                 print(f"  - Immagini caricate: {uploaded} ✅")
             else:
-                print("  - Nessuna immagine coerente (nessun upload).")
+                print("  - Nessuna immagine con confidenza sufficiente (nessun upload).")
 
             if desc_updated or uploaded>0:
                 print(f"  Admin: {ADMIN_URL.format(pid=pid)}")
