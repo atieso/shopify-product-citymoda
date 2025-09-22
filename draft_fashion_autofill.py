@@ -4,7 +4,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-22-magic+imgs-v4-colorstrict"
+VERSION = "2025-09-22-magic+imgs-v5-noface-it"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -57,12 +57,19 @@ LIFESTYLE_HINT_WORDS        = [w.strip().lower() for w in os.getenv(
 NEGATIVE_KEYWORDS_IMG       = [w.strip().lower() for w in os.getenv("NEGATIVE_KEYWORDS_IMG","logo,icon,placeholder,packaging,graphic,sprite").split(",") if w.strip()]
 COLOR_OPTION_NAMES          = [s.strip().lower() for s in os.getenv("COLOR_OPTION_NAMES","Color,Colore,Colour,COLORE,COLOUR").split(",") if s.strip()]
 
+# === Face detection (solo foto senza volti) ===
+ENFORCE_FACE_DETECTION      = os.getenv("ENFORCE_FACE_DETECTION","true").lower()=="true"
+FACE_CASCADE_PATH           = os.getenv("FACE_CASCADE_PATH","./haarcascade_frontalface_default.xml")
+FACE_CASCADE_URL            = os.getenv("FACE_CASCADE_URL","https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml")
+FACE_MIN_SIDE               = int(os.getenv("FACE_MIN_SIDE","80"))     # lato minimo volto rilevabile
+MAX_FACES_ALLOWED           = int(os.getenv("MAX_FACES_ALLOWED","0"))  # 0 = nessun volto consentito
+
 # Descrizioni / “Shopify Magic”
 WRITE_MAGIC_PROMPT_METAFIELD = os.getenv("WRITE_MAGIC_PROMPT_METAFIELD","true").lower()=="true"
 MAGIC_PROMPT_NAMESPACE = os.getenv("MAGIC_PROMPT_NAMESPACE","custom")
 MAGIC_PROMPT_KEY       = os.getenv("MAGIC_PROMPT_KEY","magic_prompt_it")
 
-# Flag legacy (usati per compatibilità con vecchie env)
+# Flag legacy (compatibilità)
 STRICT_CODE_IMAGE_MATCH = os.getenv("STRICT_CODE_IMAGE_MATCH","true").lower()=="true"
 STRICT_CODE_DESC_ONLY   = os.getenv("STRICT_CODE_DESC_ONLY","true").lower()=="true"
 
@@ -426,6 +433,59 @@ def _extract_product_structured(text):
 def _brand_domain_like(vendor, d):
     return _brand_like(vendor) in d.replace(".","")
 
+# === NO-FACE: OpenCV helper ===
+_cv2 = None
+_cascade = None
+def _ensure_face_cascade():
+    global _cv2, _cascade
+    if _cv2 is None:
+        try:
+            import cv2 as _cv2_mod
+            globals()['_cv2'] = _cv2_mod
+        except Exception as e:
+            if DEBUG: print(f"[FACE] OpenCV non disponibile: {e}")
+            return False
+    if not os.path.isfile(FACE_CASCADE_PATH):
+        try:
+            r=requests.get(FACE_CASCADE_URL, timeout=15)
+            r.raise_for_status()
+            with open(FACE_CASCADE_PATH,"wb") as f: f.write(r.content)
+            if DEBUG: print(f"[FACE] Scaricato cascade in {FACE_CASCADE_PATH}")
+        except Exception as e:
+            if DEBUG: print(f"[FACE] Impossibile scaricare cascade: {e}")
+            return False
+    try:
+        globals()['_cascade'] = _cv2.CascadeClassifier(FACE_CASCADE_PATH)
+        if _cascade.empty():
+            if DEBUG: print("[FACE] Cascade vuoto/non valido")
+            return False
+    except Exception as e:
+        if DEBUG: print(f"[FACE] Errore caricando cascade: {e}")
+        return False
+    return True
+
+def _has_faces(img_pil):
+    """Ritorna True se vengono rilevati volti >= FACE_MIN_SIDE."""
+    if not ENFORCE_FACE_DETECTION:
+        return False
+    ok = _ensure_face_cascade()
+    if not ok:
+        # se enforcement attivo e non possiamo verificare, scartiamo (trattiamo come 'has faces')
+        return True
+    try:
+        import numpy as np
+        rgb = np.array(img_pil.convert("RGB"))
+        gray = _cv2.cvtColor(rgb, _cv2.COLOR_RGB2GRAY)
+        faces = _cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=4,
+            minSize=(FACE_MIN_SIDE, FACE_MIN_SIDE)
+        )
+        return len(faces) > MAX_FACES_ALLOWED
+    except Exception as e:
+        if DEBUG: print(f"[FACE] Errore rilevamento: {e}")
+        # in dubbio, scarta
+        return True
+
 # === Candidates & filters (ranking) ===
 def score_image_url(u,vendor=""):
     d=domain(u or ""); s=0
@@ -508,6 +568,29 @@ def collect_candidate_images(queries, vendor="", code=""):
     items.sort(key=lambda it: score_image_url(it["content"], vendor))
     return items
 
+# === ITALIAN normalization ===
+IT_COLOR_MAP = {
+    "white":"bianco","off white":"bianco","antique white":"bianco antico","black":"nero","navy":"blu navy","blue":"blu",
+    "red":"rosso","green":"verde","yellow":"giallo","beige":"beige","brown":"marrone","pink":"rosa","grey":"grigio","gray":"grigio",
+}
+IT_MATERIAL_MAP = {
+    "cotton":"cotone","polyester":"poliestere","polyster":"poliestere","leather":"pelle","wool":"lana","linen":"lino","viscose":"viscosa",
+    "nylon":"nylon","elastane":"elastan","elastan":"elastan","silk":"seta","acrylic":"acrilico","down":"piuma","cashmere":"cashmere",
+}
+def _to_italian_color(s:str)->str:
+    if not s: return s
+    low=s.lower()
+    for k,v in IT_COLOR_MAP.items():
+        if k in low: return re.sub(re.escape(k), v, low).strip()
+    return s
+
+def _to_italian_material(s:str)->str:
+    if not s: return s
+    low=s.lower()
+    for k,v in IT_MATERIAL_MAP.items():
+        if k in low: return re.sub(re.escape(k), v, low).strip()
+    return s
+
 def filter_and_select_images(candidates, vendor="", title="", code="", color_pref="", want_n=5):
     from PIL import Image
     selected=[]; seen_hash=[]
@@ -529,11 +612,12 @@ def filter_and_select_images(candidates, vendor="", title="", code="", color_pre
 
         # colore deve comparire (se richiesto)
         if REQUIRE_COLOR_MATCH_IMG and color_pref:
-            c_ok = (color_pref.lower() in (url or "").lower()) \
-                   or (color_pref.lower() in (ctx or "").lower()) \
-                   or (color_pref.lower() in (safe_strip(info.get("color") or "").lower())) \
-                   or (color_pref.lower() in (safe_strip(safe_get(info,"specs","color_hint") or "").lower())) \
-                   or (color_pref.lower() in (page_txt or "").lower())
+            cp=color_pref.lower()
+            c_ok = (cp in (url or "").lower()) \
+                   or (cp in (ctx or "").lower()) \
+                   or (cp in (safe_strip(info.get("color") or "").lower())) \
+                   or (cp in (safe_strip(safe_get(info,"specs","color_hint") or "").lower())) \
+                   or (cp in (page_txt or "").lower())
             if not c_ok:
                 continue
 
@@ -549,6 +633,10 @@ def filter_and_select_images(candidates, vendor="", title="", code="", color_pre
                 continue
             if not _is_white_bg(img): 
                 continue
+            # NO FACES
+            if _has_faces(img):
+                if DEBUG: print("  - Scartata per volti rilevati")
+                continue
             hcode=_ahash(img)
             if any(_hamming(hcode, prev)<=5 for prev in seen_hash):
                 continue
@@ -560,7 +648,7 @@ def filter_and_select_images(candidates, vendor="", title="", code="", color_pre
     selected.sort(key=lambda t: t[1], reverse=True)
     return [u for (u,_) in selected]
 
-# === Descrizioni (Shopify Magic style) ===
+# === Descrizioni (Shopify Magic style) — sempre in italiano ===
 def magic_prompt_for_sku(sku: str) -> str:
     sku = safe_strip(sku) or "N/D"
     return f"descrivi prodotto {sku} in italiano, con prima parte emozionale e seconda parte Bullet Point"
@@ -568,8 +656,11 @@ def magic_prompt_for_sku(sku: str) -> str:
 def build_magic_style_description(title, vendor, ptype, code, info, color_override=""):
     title_src = safe_strip(info.get("title")) or title
     brand_src = safe_strip(info.get("brand")) or vendor
-    color     = color_override or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
-    material  = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
+    color_raw = color_override or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
+    material_raw = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
+    # normalizza in ITA
+    color     = _to_italian_color(color_raw)
+    material  = _to_italian_material(material_raw)
     sleeve    = safe_strip(safe_get(info,"specs","sleeve_hint") or "")
 
     name_bits = []
@@ -591,7 +682,10 @@ def build_magic_style_description(title, vendor, ptype, code, info, color_overri
 
     bullets=[]
     if color: bullets.append(f"Colore: {html.escape(color)}")
-    if material: bullets.append(f"Composizione: {html.escape(material)}")
+    if material: 
+        # pulizia minima tipo "100% cotton" -> "100% cotone"
+        material_clean = re.sub(r"100\s*%\s*([a-z]+)", lambda m: "100% "+_to_italian_material(m.group(1)), material, flags=re.I)
+        bullets.append(f"Composizione: {html.escape(material_clean)}")
     bullets += [
         "Vestibilità confortevole e facile da abbinare",
         "Dettagli essenziali e finiture curate",
@@ -653,7 +747,7 @@ def extract_shopify_color(product_node: dict) -> str:
         tags = [t.strip() for t in safe_strip(product_node.get("tags") or "").split(",") if t.strip()]
         for t in tags:
             tl=t.lower()
-            if any(k in tl for k in ["bianco","nero","blu","rosso","verde","giallo","beige","grigio","marrone","rosa","antico","navy","white","black","red","green","yellow","beige","brown","pink","grey","gray","blue"]):
+            if any(k in tl for k in ["bianco","nero","blu","rosso","verde","giallo","beige","grigio","marrone","rosa","antico","navy","white","black","red","green","yellow","brown","pink","grey","gray","blue"]):
                 return t
     except Exception:
         pass
@@ -679,16 +773,12 @@ def report_and_exit(results, scanned, processed, skipped):
             for r in results: w.writerow(r)
         print(f"[REPORT] Salvato: {csv_path}")
         print("[REPORT HEAD]")
-        with open(csv_path(),"r",encoding="utf-8") as f:  # small typo guard
-            pass
-    except Exception:
-        try:
-            with open(csv_path,"r",encoding="utf-8") as f:
-                for i,line in enumerate(f):
-                    print(line.rstrip())
-                    if i>=10: break
-        except Exception as e:
-            print(f"[REPORT ERROR] {e}")
+        with open(csv_path,"r",encoding="utf-8") as f:
+            for i,line in enumerate(f):
+                print(line.rstrip())
+                if i>=10: break
+    except Exception as e:
+        print(f"[REPORT ERROR] {e}")
     print(f"[SUMMARY] Scanned: {scanned} | Updated: {processed} | Skipped: {skipped}")
 
 # === MAIN ===
@@ -797,7 +887,7 @@ def main():
             else:
                 print(f"  - Descrizione NON aggiornata (conf={desc_conf:.2f} < {DESC_CONFIDENCE_THRESHOLD} o info minime assenti)")
 
-            # ----- IMMAGINI (selettore severo con soglia + colore)
+            # ----- IMMAGINI (selettore severo con soglia + colore + no faces)
             uploaded=0; uploaded_urls=[]
             img_urls=[]
             if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
@@ -828,7 +918,7 @@ def main():
                         print(f"  - ERRORE immagine: {ex}")
                 print(f"  - Immagini caricate: {uploaded} ✅")
             else:
-                print("  - Nessuna immagine con confidenza sufficiente/colore coerente (nessun upload).")
+                print("  - Nessuna immagine con confidenza sufficiente/colore coerente/senza volti (nessun upload).")
 
             if desc_updated or uploaded>0:
                 print(f"  Admin: {ADMIN_URL.format(pid=pid)}")
