@@ -1,10 +1,10 @@
-import os, sys, html, json, csv, re, traceback, requests
+import os, sys, html, json, csv, re, traceback, requests, base64
 from urllib.parse import urlparse
 from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-22-magic+imgs-v5-noface-it"
+VERSION = "2025-09-23-magic+imgs-v6-coloredbg+rembg"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -19,11 +19,12 @@ GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "")
 MAX_IMAGES_PER_PRODUCT = min(int(os.getenv("MAX_IMAGES_PER_PRODUCT", "5")), 5)
 MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
 
-# Domini brand/retailer affidabili
+# Domini brand/retailer affidabili (default arricchito coi retailer richiesti)
 BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST","").split(",") if d.strip()]
 TRUSTED_RETAILER_DOMAINS = [d.strip().lower() for d in os.getenv(
     "TRUSTED_RETAILER_DOMAINS",
-    "zalando.,aboutyou.,farfetch.,yoox.,ssense.,endclothing.,footlocker.,jdsports.,luisaviaroma.,zappos.,asos.,cdn.shopify.com,shopifycdn.com"
+    "zalando.,aboutyou.,farfetch.,yoox.,ssense.,endclothing.,footlocker.,jdsports.,luisaviaroma.,zappos.,asos.,cdn.shopify.com,shopifycdn.com,"
+    "wardow.,modivo.,answear.,pavidas.,scuderistore.,gullivermoda.,giglio.,negozipelizzari.,miriade.,sorelleramonda."
 ).split(",") if d.strip()]
 
 DOMAINS_BLACKLIST = ["ebay.","aliexpress.","pinterest.","facebook.","tumblr.","wordpress.","blogspot.","vk.","tiktok.","twitter.","x.com","instagram."]
@@ -37,6 +38,14 @@ IMAGE_MIN_SIDE       = int(os.getenv("IMAGE_MIN_SIDE","800"))
 DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC","10"))
 MAX_DOWNLOAD_BYTES   = int(os.getenv("MAX_DOWNLOAD_BYTES","3500000"))
 CONTEXT_FETCH_MAX    = int(os.getenv("CONTEXT_FETCH_MAX","300000"))
+
+# === Background handling ===
+ALLOW_COLORED_BG              = os.getenv("ALLOW_COLORED_BG","true").lower()=="true"
+PLAIN_BG_COLOR_DIST           = int(os.getenv("PLAIN_BG_COLOR_DIST","18"))   # distanza max per considerare uniforme
+PLAIN_BG_MIN_RATIO            = float(os.getenv("PLAIN_BG_MIN_RATIO","0.80"))# % bordi uniformi
+ENABLE_BG_REMOVAL             = os.getenv("ENABLE_BG_REMOVAL","true").lower()=="true"
+ENFORCE_BG_REMOVAL            = os.getenv("ENFORCE_BG_REMOVAL","false").lower()=="true"  # se true e rembg non disponibile -> scarta
+ACCEPT_COLORED_IF_REMOVE_FAIL = os.getenv("ACCEPT_COLORED_IF_REMOVE_FAIL","true").lower()=="true"
 
 # === Strictness & soglie ===
 REQUIRE_BRAND_MATCH         = os.getenv("REQUIRE_BRAND_MATCH","true").lower()=="true"
@@ -61,8 +70,8 @@ COLOR_OPTION_NAMES          = [s.strip().lower() for s in os.getenv("COLOR_OPTIO
 ENFORCE_FACE_DETECTION      = os.getenv("ENFORCE_FACE_DETECTION","true").lower()=="true"
 FACE_CASCADE_PATH           = os.getenv("FACE_CASCADE_PATH","./haarcascade_frontalface_default.xml")
 FACE_CASCADE_URL            = os.getenv("FACE_CASCADE_URL","https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml")
-FACE_MIN_SIDE               = int(os.getenv("FACE_MIN_SIDE","80"))     # lato minimo volto rilevabile
-MAX_FACES_ALLOWED           = int(os.getenv("MAX_FACES_ALLOWED","0"))  # 0 = nessun volto consentito
+FACE_MIN_SIDE               = int(os.getenv("FACE_MIN_SIDE","80"))
+MAX_FACES_ALLOWED           = int(os.getenv("MAX_FACES_ALLOWED","0"))
 
 # Descrizioni / “Shopify Magic”
 WRITE_MAGIC_PROMPT_METAFIELD = os.getenv("WRITE_MAGIC_PROMPT_METAFIELD","true").lower()=="true"
@@ -102,14 +111,9 @@ def domain(u):
 def product_id_from_gid(gid:str)->int:
     return int(str(gid).split("/")[-1])
 
-def _norm(s):
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-
-def _brand_like(s):
-    return _norm(s)
-
-def _bool_score(ok, w):
-    return w if ok else 0.0
+def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+def _brand_like(s): return _norm(s)
+def _bool_score(ok, w): return w if ok else 0.0
 
 def shopify_graphql(q, vars_=None):
     url=f"https://{STORE}/admin/api/{APIV}/graphql.json"
@@ -128,6 +132,15 @@ def add_image(product_id_num: int, image_src: str, alt_text: str=""):
     r.raise_for_status()
     return safe_get(r.json(), "image", "id")
 
+def add_image_attachment(product_id_num:int, image_bytes:bytes, filename:str="image.png", alt_text:str=""):
+    url = f"https://{STORE}/admin/api/{APIV}/products/{product_id_num}/images.json"
+    h = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload = {"image": {"attachment": b64, "filename": filename, "alt": (alt_text or "")[:255]}}
+    r = requests.post(url, json=payload, headers=h, timeout=30)
+    r.raise_for_status()
+    return safe_get(r.json(), "image", "id")
+
 def update_description(product_id_num: int, body_html: str):
     url = f"https://{STORE}/admin/api/{APIV}/products/{product_id_num}.json"
     h = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
@@ -136,7 +149,6 @@ def update_description(product_id_num: int, body_html: str):
     return True
 
 def create_or_update_metafield(product_id_num:int, namespace:str, key:str, value:str, value_type="single_line_text_field"):
-    """Crea/aggiorna un metafield testo su prodotto."""
     url = f"https://{STORE}/admin/api/{APIV}/metafields.json"
     h = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
     payload = {
@@ -151,7 +163,6 @@ def create_or_update_metafield(product_id_num:int, namespace:str, key:str, value
     }
     r = requests.post(url, json=payload, headers=h, timeout=30)
     if r.status_code == 422:
-        # Metafield esiste già -> update via GraphQL
         q = """
         query($id:ID!){
           product(id:$id){
@@ -179,8 +190,7 @@ def sku_root(s: str) -> str:
     s = safe_strip(s)
     if not s: return ""
     for sep in ["_", "-"]:
-        if sep in s:
-            return s.split(sep,1)[0]
+        if sep in s: return s.split(sep,1)[0]
     return s
 
 def supplier_code_from_sku(sku: str) -> str:
@@ -189,14 +199,11 @@ def supplier_code_from_sku(sku: str) -> str:
     if SUPPLIER_CODE_REGEX:
         try:
             m = re.search(SUPPLIER_CODE_REGEX, sku)
-            if m and m.groupdict().get("code"):
-                return m.group("code").strip()
-        except Exception:
-            pass
+            if m and m.groupdict().get("code"): return m.group("code").strip()
+        except Exception: pass
     return sku[SUPPLIER_CODE_OFFSET:] if len(sku)>SUPPLIER_CODE_OFFSET else sku
 
 def expand_sku_terms_for_selection(input_skus):
-    """SKU originale + radice + supplier + supplier_radice (dedup)."""
     seen=set(); out=[]
     for s in input_skus:
         if not s: continue
@@ -215,7 +222,6 @@ def expand_sku_terms_for_selection(input_skus):
 
 # === Product variant fetch (SKU) ===
 def fetch_products_by_variants_query_terms(terms, kind="sku"):
-    """Query robuste per variants in draft; ritorna prodotti (dedup)."""
     if not terms: return []
     out={}
     q = """
@@ -246,7 +252,6 @@ def fetch_products_by_variants_query_terms(terms, kind="sku"):
     return list(out.values())
 
 def fallback_scan_draft_products_and_filter(terms, limit_pages=6):
-    """Scansiona solo draft e filtra localmente per sku==, startswith, radice."""
     if not terms: return []
     terms_all=set(t.lower() for t in terms)
     for t in list(terms_all): terms_all.add(sku_root(t).lower())
@@ -261,8 +266,7 @@ def fallback_scan_draft_products_and_filter(terms, limit_pages=6):
           variants(first:100){{ edges{{ node{{ id sku barcode title selectedOptions{{ name value }} }} }} }}
         }} }}
       }}
-    }}
-    """
+    }}"""
     after=None; pages=0
     while pages<limit_pages:
         data=shopify_graphql(q,{"first":50,"after":after})
@@ -307,7 +311,7 @@ def google_cse_image_search(qry, per_page=10, pages=3):
     for i in range(pages):
         start=1+i*per_page
         params={"key":GOOGLE_CSE_KEY,"cx":GOOGLE_CSE_CX,"q":qry,"searchType":"image","num":per_page,
-                "start":start,"safe":"active","imgType":"photo","imgDominantColor":"white"}
+                "start":start,"safe":"active","imgType":"photo"}
         try:
             r=requests.get(base,params=params,timeout=20)
             if r.status_code>=400:
@@ -368,8 +372,7 @@ def _ahash(img, hash_size=8):
     px=list(im.getdata()); avg=sum(px)/len(px)
     return "".join("1" if p>avg else "0" for p in px)
 
-def _hamming(a,b):
-    return sum(ch1!=ch2 for ch1,ch2 in zip(a,b))
+def _hamming(a,b): return sum(ch1!=ch2 for ch1,ch2 in zip(a,b))
 
 def _is_white_bg(img):
     im=img.convert("RGB"); w,h=im.size
@@ -388,6 +391,34 @@ def _is_white_bg(img):
             tot+=1
     ratio = (white/max(1,tot))
     return ratio>=WHITE_BG_MIN_RATIO
+
+def _plain_bg_ratio(img):
+    """Stima uniformità del bordo: % pixel 'vicini' al colore medio (accetta sfondi colorati omogenei)."""
+    from PIL import ImageStat
+    im=img.convert("RGB"); w,h=im.size
+    if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: return 0.0
+    bw=int(w*WHITE_BG_BORDER_PCT); bh=int(h*WHITE_BG_BORDER_PCT)
+    coords = []
+    coords += [(x,y) for y in range(0,bh) for x in range(w)]
+    coords += [(x,y) for y in range(h-bh,h) for x in range(w)]
+    coords += [(x,y) for y in range(bh,h-bh) for x in range(0,bw)]
+    coords += [(x,y) for y in range(bh,h-bh) for x in range(w-bw,w)]
+    px=im.load()
+    # calcola colore medio bordo
+    rs=[]; gs=[]; bs=[]
+    for (x,y) in coords:
+        r,g,b=px[x,y]; rs.append(r); gs.append(g); bs.append(b)
+    if not rs: return 0.0
+    r0=sum(rs)/len(rs); g0=sum(gs)/len(gs); b0=sum(bs)/len(bs)
+    th = PLAIN_BG_COLOR_DIST
+    ok=0
+    for (x,y) in coords:
+        r,g,b=px[x,y]
+        if abs(r-r0)<=th and abs(g-g0)<=th and abs(b-b0)<=th: ok+=1
+    return ok/max(1,len(coords))
+
+def _is_plain_colored_bg(img):
+    return _plain_bg_ratio(img) >= PLAIN_BG_MIN_RATIO
 
 def _context_has_code(text, code):
     if not code: return False
@@ -410,10 +441,8 @@ def _extract_product_structured(text):
         prod={}
         for d in candidates:
             if not isinstance(d, dict): continue
-            t=d.get("@type")
-            types = [t] if isinstance(t,str) else (t or [])
-            if "Product" in types:
-                prod.update(d)
+            t=d.get("@type"); types = [t] if isinstance(t,str) else (t or [])
+            if "Product" in types: prod.update(d)
         info={"title": prod.get("name") or og_title or meta_title,
               "brand": (prod.get("brand",{}) or {}).get("name") if isinstance(prod.get("brand"),dict) else prod.get("brand"),
               "gtin13": prod.get("gtin13") or prod.get("gtin") or prod.get("gtin8") or prod.get("isbn"),
@@ -430,8 +459,7 @@ def _extract_product_structured(text):
     except Exception:
         return {}
 
-def _brand_domain_like(vendor, d):
-    return _brand_like(vendor) in d.replace(".","")
+def _brand_domain_like(vendor, d): return _brand_like(vendor) in d.replace(".","")
 
 # === NO-FACE: OpenCV helper ===
 _cv2 = None
@@ -465,26 +493,29 @@ def _ensure_face_cascade():
     return True
 
 def _has_faces(img_pil):
-    """Ritorna True se vengono rilevati volti >= FACE_MIN_SIDE."""
-    if not ENFORCE_FACE_DETECTION:
-        return False
+    if not ENFORCE_FACE_DETECTION: return False
     ok = _ensure_face_cascade()
-    if not ok:
-        # se enforcement attivo e non possiamo verificare, scartiamo (trattiamo come 'has faces')
-        return True
+    if not ok: return True  # se non possiamo controllare, scartiamo
     try:
         import numpy as np
         rgb = np.array(img_pil.convert("RGB"))
         gray = _cv2.cvtColor(rgb, _cv2.COLOR_RGB2GRAY)
-        faces = _cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=4,
-            minSize=(FACE_MIN_SIDE, FACE_MIN_SIDE)
-        )
+        faces = _cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(FACE_MIN_SIDE, FACE_MIN_SIDE))
         return len(faces) > MAX_FACES_ALLOWED
     except Exception as e:
         if DEBUG: print(f"[FACE] Errore rilevamento: {e}")
-        # in dubbio, scarta
         return True
+
+# === Background removal (rembg) ===
+def _remove_bg(image_bytes: bytes) -> bytes or None:
+    if not ENABLE_BG_REMOVAL: return None
+    try:
+        from rembg import remove
+        out = remove(image_bytes)  # PNG con alpha
+        return out
+    except Exception as e:
+        if DEBUG: print(f"[BG] Rimozione sfondo non disponibile/errore: {e}")
+        return None
 
 # === Candidates & filters (ranking) ===
 def score_image_url(u,vendor=""):
@@ -509,23 +540,18 @@ def _has_negative_keywords(url, ctx):
 
 # === Confidence models ===
 def _desc_confidence(vendor, code, info, page_domain, page_text):
-    brand_page = _brand_like(safe_strip(info.get("brand")))
-    brand_prod = _brand_like(vendor)
+    brand_page = _brand_like(safe_strip(info.get("brand"))); brand_prod = _brand_like(vendor)
     brand_match = bool(brand_page) and brand_page==brand_prod
     brand_in_domain = bool(brand_prod) and (brand_prod in page_domain.replace(".",""))
     code_in_struct = any((safe_strip(info.get(k)) or "").lower()==(code or "").lower() for k in ["sku","mpn","gtin13","gtin"])
     code_in_text = _context_has_code(page_text, code)
-
     s = 0.0
     s += _bool_score(code_in_struct, 0.5)
     s += _bool_score(code_in_text,   0.3)
     s += _bool_score(brand_match,    0.3)
     s += _bool_score(brand_in_domain,0.2)
-
-    if REQUIRE_BRAND_MATCH and not (brand_match or brand_in_domain):
-        return 0.0
-    if REQUIRE_CODE_IN_URL_OR_CTX and not (code_in_struct or code_in_text):
-        return 0.0
+    if REQUIRE_BRAND_MATCH and not (brand_match or brand_in_domain): return 0.0
+    if REQUIRE_CODE_IN_URL_OR_CTX and not (code_in_struct or code_in_text): return 0.0
     return min(s,1.0)
 
 def _img_confidence(vendor, code, url, ctx, page_text, info):
@@ -535,7 +561,6 @@ def _img_confidence(vendor, code, url, ctx, page_text, info):
     code_in_url = (code or "").lower() in (url or "").lower()
     code_in_struct = any((safe_strip(info.get(k)) or "").lower()==(code or "").lower() for k in ["sku","mpn","gtin13","gtin"])
     code_in_text = _context_has_code(page_text, code)
-
     s = 0.0
     s += _bool_score(code_in_url,        0.35)
     s += _bool_score(code_in_struct,     0.35)
@@ -544,13 +569,9 @@ def _img_confidence(vendor, code, url, ctx, page_text, info):
     s += _bool_score(brand_in_domain,    0.20)
     if any(w in d for w in BRAND_DOMAINS_WHITELIST): s += 0.25
     elif any(w in d for w in TRUSTED_RETAILER_DOMAINS): s += 0.15
-
-    if REQUIRE_TRUSTED_DOMAIN_IMG and not (any(w in d for w in BRAND_DOMAINS_WHITELIST) or any(w in d for w in TRUSTED_RETAILER_DOMAINS)):
-        return 0.0
-    if REQUIRE_BRAND_MATCH and not (brand_ok or brand_in_domain):
-        return 0.0
-    if REQUIRE_CODE_IN_URL_OR_CTX and not (code_in_url or code_in_struct or code_in_text):
-        return 0.0
+    if REQUIRE_TRUSTED_DOMAIN_IMG and not (any(w in d for w in BRAND_DOMAINS_WHITELIST) or any(w in d for w in TRUSTED_RETAILER_DOMAINS)): return 0.0
+    if REQUIRE_BRAND_MATCH and not (brand_ok or brand_in_domain): return 0.0
+    if REQUIRE_CODE_IN_URL_OR_CTX and not (code_in_url or code_in_struct or code_in_text): return 0.0
     return min(s, 1.0)
 
 # === Search wrappers ===
@@ -583,7 +604,6 @@ def _to_italian_color(s:str)->str:
     for k,v in IT_COLOR_MAP.items():
         if k in low: return re.sub(re.escape(k), v, low).strip()
     return s
-
 def _to_italian_material(s:str)->str:
     if not s: return s
     low=s.lower()
@@ -598,14 +618,11 @@ def filter_and_select_images(candidates, vendor="", title="", code="", color_pre
         if len(selected)>=want_n: break
         url=it["content"]; ctx=it.get("context") or url
 
-        if _has_negative_keywords(url, ctx): 
-            continue
-        if REJECT_LIFESTYLE_HINTS and _is_lifestyle_url_or_ctx(url, ctx):
-            continue
+        if _has_negative_keywords(url, ctx): continue
+        if REJECT_LIFESTYLE_HINTS and _is_lifestyle_url_or_ctx(url, ctx): continue
 
         data=_download_bytes(url)
-        if not data: 
-            continue
+        if not data: continue
 
         page_txt = _http_get_text(ctx, limit_bytes=CONTEXT_FETCH_MAX) if ctx else ""
         info = _extract_product_structured(page_txt) if page_txt else {}
@@ -618,37 +635,74 @@ def filter_and_select_images(candidates, vendor="", title="", code="", color_pre
                    or (cp in (safe_strip(info.get("color") or "").lower())) \
                    or (cp in (safe_strip(safe_get(info,"specs","color_hint") or "").lower())) \
                    or (cp in (page_txt or "").lower())
-            if not c_ok:
-                continue
+            if not c_ok: continue
 
         conf = _img_confidence(vendor, code, url, ctx, page_txt, info)
-        if conf < IMG_CONFIDENCE_THRESHOLD:
-            continue
+        if conf < IMG_CONFIDENCE_THRESHOLD: continue
 
         try:
             from io import BytesIO
             img=Image.open(BytesIO(data))
             w,h=img.size
-            if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: 
-                continue
-            if not _is_white_bg(img): 
-                continue
-            # NO FACES
+            if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: continue
+            # No volti
             if _has_faces(img):
                 if DEBUG: print("  - Scartata per volti rilevati")
                 continue
-            hcode=_ahash(img)
-            if any(_hamming(hcode, prev)<=5 for prev in seen_hash):
-                continue
+
+            bg_white = _is_white_bg(img)
+            bg_plain = _is_plain_colored_bg(img) if ALLOW_COLORED_BG else False
+
+            plan = None
+            out_bytes = None
+            if bg_white:
+                plan = ("src", url)  # ok così com'è
+            elif bg_plain and ENABLE_BG_REMOVAL:
+                out_bytes = _remove_bg(data)
+                if out_bytes:
+                    plan = ("attachment", out_bytes)
+                else:
+                    if ENFORCE_BG_REMOVAL:
+                        continue
+                    plan = ("src", url) if ACCEPT_COLORED_IF_REMOVE_FAIL else None
+            elif bg_plain and not ENABLE_BG_REMOVAL:
+                plan = ("src", url) if ACCEPT_COLORED_IF_REMOVE_FAIL else None
+            else:
+                # sfondo complesso: prova comunque a rimuovere se abilitato
+                if ENABLE_BG_REMOVAL:
+                    out_bytes = _remove_bg(data)
+                    if out_bytes:
+                        plan = ("attachment", out_bytes)
+                    else:
+                        if ENFORCE_BG_REMOVAL:
+                            continue
+                        plan = None
+                else:
+                    plan = None
+
+            if not plan: continue
+
+            # hash per dedup (su immagine "finale" se disponibile)
+            try:
+                if plan[0]=="attachment":
+                    img2=Image.open(BytesIO(plan[1]))
+                else:
+                    img2=img
+                hcode=_ahash(img2)
+            except Exception:
+                hcode=_ahash(img)
+            if any(_hamming(hcode, prev)<=5 for prev in seen_hash): continue
             seen_hash.append(hcode)
-            selected.append((url, conf))
+
+            selected.append({"plan":plan, "url":url, "conf":conf})
         except Exception:
             continue
 
-    selected.sort(key=lambda t: t[1], reverse=True)
-    return [u for (u,_) in selected]
+    # Ordina per confidenza
+    selected.sort(key=lambda t: t["conf"], reverse=True)
+    return selected
 
-# === Descrizioni (Shopify Magic style) — sempre in italiano ===
+# === Descrizioni (Shopify Magic style) — ITA ===
 def magic_prompt_for_sku(sku: str) -> str:
     sku = safe_strip(sku) or "N/D"
     return f"descrivi prodotto {sku} in italiano, con prima parte emozionale e seconda parte Bullet Point"
@@ -658,7 +712,6 @@ def build_magic_style_description(title, vendor, ptype, code, info, color_overri
     brand_src = safe_strip(info.get("brand")) or vendor
     color_raw = color_override or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
     material_raw = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
-    # normalizza in ITA
     color     = _to_italian_color(color_raw)
     material  = _to_italian_material(material_raw)
     sleeve    = safe_strip(safe_get(info,"specs","sleeve_hint") or "")
@@ -672,18 +725,14 @@ def build_magic_style_description(title, vendor, ptype, code, info, color_overri
     emo = f"Indossa {html.escape(display_name)}"
     if brand_src: emo += f" di {html.escape(brand_src)}"
     emo += " e scopri un equilibrio perfetto tra stile e comfort quotidiano."
-    if color:
-        emo += f" La tonalità {html.escape(color)} valorizza il tuo look."
-    if material:
-        emo += f" La composizione selezionata garantisce una mano piacevole e durata nel tempo."
-    if sleeve:
-        emo += f" Dettagli come {html.escape(sleeve)} completano l’insieme."
+    if color: emo += f" La tonalità {html.escape(color)} valorizza il tuo look."
+    if material: emo += f" La composizione selezionata garantisce una mano piacevole e durata nel tempo."
+    if sleeve: emo += f" Dettagli come {html.escape(sleeve)} completano l’insieme."
     emo_par = f"<p>{emo}</p>"
 
     bullets=[]
     if color: bullets.append(f"Colore: {html.escape(color)}")
-    if material: 
-        # pulizia minima tipo "100% cotton" -> "100% cotone"
+    if material:
         material_clean = re.sub(r"100\s*%\s*([a-z]+)", lambda m: "100% "+_to_italian_material(m.group(1)), material, flags=re.I)
         bullets.append(f"Composizione: {html.escape(material_clean)}")
     bullets += [
@@ -709,29 +758,22 @@ def gen_description_from_sources_magic_format(title, vendor, ptype, code, color_
             if not txt: continue
             info=_extract_product_structured(txt)
             conf=_desc_confidence(vendor, code, info, d, txt)
-            # serve almeno MIN_FIELDS_FOR_DESC tra colore/materiale (o color_pref da Shopify)
             fields = 0
             if color_pref or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or ""): fields += 1
             if safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or ""): fields += 1
             if conf>=DESC_CONFIDENCE_THRESHOLD and fields>=MIN_FIELDS_FOR_DESC:
-                best=(link, info, conf)
-                break
+                best=(link, info, conf); break
         if best: break
-
     if best:
         link, info, conf = best
         desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
         return desc_html, link, conf
-
-    # fallback “sicuro”: NON scriviamo (conf 0.0) — userai Magic manualmente
     info={}
     desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
     return desc_html, None, 0.0
 
 # === Shopify color extraction ===
 def extract_shopify_color(product_node: dict) -> str:
-    """Ritorna un colore leggendo: varianti.selectedOptions, poi tags, poi title."""
-    # 1) varianti -> selectedOptions
     try:
         for ve in safe_get(product_node,"variants","edges",default=[]) or []:
             opts = safe_get(ve,"node","selectedOptions",default=[]) or []
@@ -740,18 +782,14 @@ def extract_shopify_color(product_node: dict) -> str:
                 val  = safe_strip(o.get("value",""))
                 if name in COLOR_OPTION_NAMES and val:
                     return val
-    except Exception:
-        pass
-    # 2) tags
+    except Exception: pass
     try:
         tags = [t.strip() for t in safe_strip(product_node.get("tags") or "").split(",") if t.strip()]
         for t in tags:
             tl=t.lower()
             if any(k in tl for k in ["bianco","nero","blu","rosso","verde","giallo","beige","grigio","marrone","rosa","antico","navy","white","black","red","green","yellow","brown","pink","grey","gray","blue"]):
                 return t
-    except Exception:
-        pass
-    # 3) title hint
+    except Exception: pass
     ttl = safe_strip(product_node.get("title"))
     m = re.search(r"\b(bianco( antico)?|nero|blu|rosso|verde|giallo|beige|grigio|marrone|rosa|navy|white|black|red|green|yellow|brown|pink|grey|gray|blue)\b", ttl or "", re.I)
     if m: return m.group(0)
@@ -793,19 +831,13 @@ def main():
 
     results=[]; scanned=processed=skipped=0
 
-    # espandi termini per selezione in draft
     sku_terms = expand_sku_terms_for_selection(ALLOWED_SKUS)
     if DEBUG: print(f"[DEBUG] SKU terms (expanded): {', '.join(sku_terms)}")
 
-    # 1) ricerca variants per SKU
     edges = fetch_products_by_variants_query_terms(sku_terms, kind="sku")
+    if not edges: edges = fallback_scan_draft_products_and_filter(sku_terms, limit_pages=6)
 
-    # 2) fallback: scan solo draft e match locale
-    if not edges:
-        edges = fallback_scan_draft_products_and_filter(sku_terms, limit_pages=6)
-
-    # dedup per product.id
-    uniq={}
+    uniq={}; 
     for e in edges:
         n=e.get("node")
         if n: uniq[n["id"]]=e
@@ -821,27 +853,22 @@ def main():
         scanned+=1
         try:
             pid=product_id_from_gid(n["id"])
-            title=safe_strip(n.get("title"))
-            vendor=safe_strip(n.get("vendor"))
-            ptype=safe_strip(n.get("productType"))
-            status=safe_strip(n.get("status")).lower()
+            title=safe_strip(n.get("title")); vendor=safe_strip(n.get("vendor"))
+            ptype=safe_strip(n.get("productType")); status=safe_strip(n.get("status")).lower()
 
             has_img = len(safe_get(n,"images","edges",default=[]) or [])>0
             has_desc = bool(safe_strip(n.get("bodyHtml")))
 
             if status!="draft":
-                skipped+=1
-                print(f"[PROCESS] {title} | brand={vendor or '-'} | SKIP: non DRAFT")
+                skipped+=1; print(f"[PROCESS] {title} | brand={vendor or '-'} | SKIP: non DRAFT")
                 results.append(row(pid,title,vendor,"",0,False,"skip: non draft")); continue
             if has_img or has_desc:
-                why=[]
+                why=[]; 
                 if has_img: why.append("ha immagini")
                 if has_desc: why.append("ha descrizione")
-                skipped+=1
-                print(f"[PROCESS] {title} | brand={vendor or '-'} | SKIP: {', '.join(why)}")
+                skipped+=1; print(f"[PROCESS] {title} | brand={vendor or '-'} | SKIP: {', '.join(why)}")
                 results.append(row(pid,title,vendor,"",0,False,"skip: "+", ".join(why))); continue
 
-            # scegli una variante che matcha i termini per derivare il codice web
             chosen_sku=""
             for ve in (safe_get(n,"variants","edges",default=[]) or []):
                 s=safe_strip(safe_get(ve,"node","sku"))
@@ -853,18 +880,14 @@ def main():
                 v_edges=safe_get(n,"variants","edges",default=[]) or []
                 if v_edges: chosen_sku=safe_strip(safe_get(v_edges[0],"node","sku"))
 
-            # per il WEB: togli primi 6 e la taglia
             supplier = supplier_code_from_sku(chosen_sku) if chosen_sku else ""
             supplier_root = sku_root(supplier) if supplier else ""
             code_for_search = supplier_root or supplier
             code_msg = code_for_search or "(no-code)"
-
             print(f"[PROCESS] {title} | brand={vendor or '-'} | code={code_msg} (from SKU {chosen_sku or '-'})")
 
-            # colore dal prodotto Shopify (guida tutto)
             color_pref = extract_shopify_color(n)
-            if color_pref:
-                print(f"  - Colore (Shopify): {color_pref}")
+            if color_pref: print(f"  - Colore (Shopify): {color_pref}")
 
             # ----- METAFIELD prompt per Shopify Magic
             if WRITE_MAGIC_PROMPT_METAFIELD and chosen_sku:
@@ -875,21 +898,20 @@ def main():
                 except Exception as ex:
                     print(f"  - ERRORE metafield Magic: {ex}")
 
-            # ----- DESCRIZIONE (intro emozionale + bullets) con soglia confidenza + info minime reali
+            # ----- DESCRIZIONE
             desc_updated=False; used_context_url=""; desc_conf=0.0
             desc_html=""; ctx=None
             if code_for_search:
                 desc_html, ctx, desc_conf = gen_description_from_sources_magic_format(title, vendor, ptype, code_for_search, color_pref=color_pref)
-
             if desc_conf >= DESC_CONFIDENCE_THRESHOLD and desc_html:
                 update_description(pid, desc_html); desc_updated=True; print(f"  - Descrizione aggiornata (conf={desc_conf:.2f}) ✅")
                 if ctx: used_context_url=ctx; print(f"    • Fonte: {ctx}")
             else:
                 print(f"  - Descrizione NON aggiornata (conf={desc_conf:.2f} < {DESC_CONFIDENCE_THRESHOLD} o info minime assenti)")
 
-            # ----- IMMAGINI (selettore severo con soglia + colore + no faces)
-            uploaded=0; uploaded_urls=[]
-            img_urls=[]
+            # ----- IMMAGINI
+            uploaded=0; uploaded_refs=[]
+            selected=[]
             if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
                 q_img=[]
                 if code_for_search:
@@ -898,32 +920,38 @@ def main():
                     if color_pref:
                         q_img += [
                             f"\"{code_for_search}\" \"{color_pref}\" packshot",
-                            f"{vendor} {code_for_search} \"{color_pref}\" white background",
-                            f"{title} {code_for_search} \"{color_pref}\" white background",
+                            f"{vendor} {code_for_search} \"{color_pref}\" studio",
+                            f"{title} {code_for_search} \"{color_pref}\" background",
                         ]
                     # site: brand/retailer (sempre)
                     q_img += [f"site:{d} {code_for_search} {color_pref}".strip() for d in (BRAND_DOMAINS_WHITELIST+TRUSTED_RETAILER_DOMAINS)]
                     if not DISABLE_GENERIC_IMAGE_QUERIES:
-                        q_img += [f"{base} packshot", f"{base} white background"]
+                        q_img += [f"{base} packshot", f"{base} studio background"]
                 cands = collect_candidate_images(q_img, vendor=vendor, code=code_for_search)
-                img_urls = filter_and_select_images(cands, vendor=vendor, title=title, code=code_for_search, color_pref=color_pref, want_n=MAX_IMAGES_PER_PRODUCT)
+                selected = filter_and_select_images(cands, vendor=vendor, title=title, code=code_for_search, color_pref=color_pref, want_n=MAX_IMAGES_PER_PRODUCT)
 
-            if img_urls:
-                for u in img_urls:
+            if selected:
+                for item in selected:
+                    plan = item["plan"]; alt=f"{vendor} {title}".strip()
                     try:
-                        img_id=add_image(pid,u,alt_text=f"{vendor} {title}".strip()); uploaded+=1
-                        uploaded_urls.append(u)
-                        print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅")
+                        if plan[0]=="attachment":
+                            img_id=add_image_attachment(pid, plan[1], filename=f"{pid}_{int(datetime.now().timestamp())}.png", alt_text=alt)
+                            uploaded_refs.append("attachment:bg-removed")
+                        else:
+                            img_id=add_image(pid, plan[1], alt_text=alt)
+                            uploaded_refs.append(plan[1])
+                        uploaded+=1
+                        print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅ [{plan[0]}]")
                     except Exception as ex:
                         print(f"  - ERRORE immagine: {ex}")
                 print(f"  - Immagini caricate: {uploaded} ✅")
             else:
-                print("  - Nessuna immagine con confidenza sufficiente/colore coerente/senza volti (nessun upload).")
+                print("  - Nessuna immagine idonea (sfondo/volti/brand/codice/colore).")
 
             if desc_updated or uploaded>0:
                 print(f"  Admin: {ADMIN_URL.format(pid=pid)}")
 
-            results.append(row(pid,title,vendor,code_for_search,uploaded,desc_updated,"",used_context_url," | ".join(uploaded_urls)))
+            results.append(row(pid,title,vendor,code_for_search,uploaded,desc_updated,"",used_context_url," | ".join(uploaded_refs)))
             if desc_updated or uploaded>0: processed+=1
             else: skipped+=1
 
