@@ -1,10 +1,11 @@
+# -*- coding: utf-8 -*-
 import os, sys, html, json, csv, re, traceback, requests, base64
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-23-magic+imgs-v6-coloredbg+rembg"
+VERSION = "2025-09-24-magic+imgs-v7-gallery-single-source+face-crop+rename-jpg"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -19,7 +20,6 @@ GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX", "")
 MAX_IMAGES_PER_PRODUCT = min(int(os.getenv("MAX_IMAGES_PER_PRODUCT", "5")), 5)
 MAX_PRODUCTS           = int(os.getenv("MAX_PRODUCTS", "25"))
 
-# Domini brand/retailer affidabili (default arricchito coi retailer richiesti)
 BRAND_DOMAINS_WHITELIST = [d.strip().lower() for d in os.getenv("BRAND_DOMAINS_WHITELIST","").split(",") if d.strip()]
 TRUSTED_RETAILER_DOMAINS = [d.strip().lower() for d in os.getenv(
     "TRUSTED_RETAILER_DOMAINS",
@@ -41,10 +41,10 @@ CONTEXT_FETCH_MAX    = int(os.getenv("CONTEXT_FETCH_MAX","300000"))
 
 # === Background handling ===
 ALLOW_COLORED_BG              = os.getenv("ALLOW_COLORED_BG","true").lower()=="true"
-PLAIN_BG_COLOR_DIST           = int(os.getenv("PLAIN_BG_COLOR_DIST","18"))   # distanza max per considerare uniforme
-PLAIN_BG_MIN_RATIO            = float(os.getenv("PLAIN_BG_MIN_RATIO","0.80"))# % bordi uniformi
+PLAIN_BG_COLOR_DIST           = int(os.getenv("PLAIN_BG_COLOR_DIST","18"))
+PLAIN_BG_MIN_RATIO            = float(os.getenv("PLAIN_BG_MIN_RATIO","0.80"))
 ENABLE_BG_REMOVAL             = os.getenv("ENABLE_BG_REMOVAL","true").lower()=="true"
-ENFORCE_BG_REMOVAL            = os.getenv("ENFORCE_BG_REMOVAL","false").lower()=="true"  # se true e rembg non disponibile -> scarta
+ENFORCE_BG_REMOVAL            = os.getenv("ENFORCE_BG_REMOVAL","false").lower()=="true"
 ACCEPT_COLORED_IF_REMOVE_FAIL = os.getenv("ACCEPT_COLORED_IF_REMOVE_FAIL","true").lower()=="true"
 
 # === Strictness & soglie ===
@@ -66,7 +66,7 @@ LIFESTYLE_HINT_WORDS        = [w.strip().lower() for w in os.getenv(
 NEGATIVE_KEYWORDS_IMG       = [w.strip().lower() for w in os.getenv("NEGATIVE_KEYWORDS_IMG","logo,icon,placeholder,packaging,graphic,sprite").split(",") if w.strip()]
 COLOR_OPTION_NAMES          = [s.strip().lower() for s in os.getenv("COLOR_OPTION_NAMES","Color,Colore,Colour,COLORE,COLOUR").split(",") if s.strip()]
 
-# === Face detection (solo foto senza volti) ===
+# === Face detection (solo foto senza volti o con crop) ===
 ENFORCE_FACE_DETECTION      = os.getenv("ENFORCE_FACE_DETECTION","true").lower()=="true"
 FACE_CASCADE_PATH           = os.getenv("FACE_CASCADE_PATH","./haarcascade_frontalface_default.xml")
 FACE_CASCADE_URL            = os.getenv("FACE_CASCADE_URL","https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml")
@@ -132,7 +132,7 @@ def add_image(product_id_num: int, image_src: str, alt_text: str=""):
     r.raise_for_status()
     return safe_get(r.json(), "image", "id")
 
-def add_image_attachment(product_id_num:int, image_bytes:bytes, filename:str="image.png", alt_text:str=""):
+def add_image_attachment(product_id_num:int, image_bytes:bytes, filename:str="image.jpg", alt_text:str=""):
     url = f"https://{STORE}/admin/api/{APIV}/products/{product_id_num}/images.json"
     h = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
     b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -393,7 +393,6 @@ def _is_white_bg(img):
     return ratio>=WHITE_BG_MIN_RATIO
 
 def _plain_bg_ratio(img):
-    """Stima uniformità del bordo: % pixel 'vicini' al colore medio (accetta sfondi colorati omogenei)."""
     from PIL import ImageStat
     im=img.convert("RGB"); w,h=im.size
     if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: return 0.0
@@ -404,7 +403,6 @@ def _plain_bg_ratio(img):
     coords += [(x,y) for y in range(bh,h-bh) for x in range(0,bw)]
     coords += [(x,y) for y in range(bh,h-bh) for x in range(w-bw,w)]
     px=im.load()
-    # calcola colore medio bordo
     rs=[]; gs=[]; bs=[]
     for (x,y) in coords:
         r,g,b=px[x,y]; rs.append(r); gs.append(g); bs.append(b)
@@ -455,6 +453,25 @@ def _extract_product_structured(text):
             if "colore" in t or "color" in t: specs["color_hint"]=t
             if "maniche" in t or "sleeve" in t: specs["sleeve_hint"]=t
         info["specs"]=specs
+        # prova anche og:image e gallerie comuni
+        og_imgs=[m.get("content") for m in soup.find_all("meta",{"property":"og:image"}) if m.get("content")]
+        info["og_images"]=og_imgs
+        # immagini nella pagina
+        page_imgs=[]
+        for tag in soup.find_all(["img","source"]):
+            for attr in ["src","data-src","data-original","data-zoom-image","data-large_image","srcset","data-srcset"]:
+                val=tag.get(attr)
+                if not val: continue
+                # srcset => prendi url principale
+                if " " in val and "," in val:
+                    # prendi i candidati, scegli quello con densità più alta
+                    pairs=[p.strip() for p in val.split(",") if p.strip()]
+                    if pairs:
+                        best=pairs[-1].split(" ")[0]
+                        page_imgs.append(best)
+                else:
+                    page_imgs.append(val)
+        info["page_images"]=page_imgs
         return info
     except Exception:
         return {}
@@ -492,19 +509,43 @@ def _ensure_face_cascade():
         return False
     return True
 
-def _has_faces(img_pil):
-    if not ENFORCE_FACE_DETECTION: return False
+def _detect_faces_np(img_pil):
+    """Ritorna lista di (x,y,w,h) in coordinate immagine."""
+    if not ENFORCE_FACE_DETECTION: return []
     ok = _ensure_face_cascade()
-    if not ok: return True  # se non possiamo controllare, scartiamo
+    if not ok: return [(-1,-1,-1,-1)]  # impedisce uso se non possiamo verificare
     try:
         import numpy as np
         rgb = np.array(img_pil.convert("RGB"))
         gray = _cv2.cvtColor(rgb, _cv2.COLOR_RGB2GRAY)
         faces = _cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(FACE_MIN_SIDE, FACE_MIN_SIDE))
-        return len(faces) > MAX_FACES_ALLOWED
+        return list(faces)
     except Exception as e:
         if DEBUG: print(f"[FACE] Errore rilevamento: {e}")
-        return True
+        return [(-1,-1,-1,-1)]
+
+def _has_faces(img_pil):
+    faces=_detect_faces_np(img_pil)
+    if not faces: return False
+    if faces==[(-1,-1,-1,-1)]: return True
+    return len(faces) > MAX_FACES_ALLOWED
+
+def _crop_head_if_present(img_pil):
+    """Se trova volti, taglia la parte alta sopra ~0.6 dell'altezza del volto superiore."""
+    faces=_detect_faces_np(img_pil)
+    if not faces or faces==[(-1,-1,-1,-1)]: 
+        return img_pil, (faces!=[] and faces!=[(-1,-1,-1,-1)])
+    # trova il volto più alto (min y)
+    top_face=min(faces, key=lambda f:f[1])
+    x,y,w,h = top_face
+    W,H=img_pil.size
+    crop_top = max(0, int(y + 0.6*h))
+    # non tagliare troppo (almeno 60% altezza residua)
+    min_remain = int(0.6*H)
+    if (H - crop_top) < min_remain:
+        crop_top = max(0, H - min_remain)
+    img2 = img_pil.crop((0, crop_top, W, H))
+    return img2, True
 
 # === Background removal (rembg) ===
 def _remove_bg(image_bytes: bytes) -> bytes or None:
@@ -517,26 +558,19 @@ def _remove_bg(image_bytes: bytes) -> bytes or None:
         if DEBUG: print(f"[BG] Rimozione sfondo non disponibile/errore: {e}")
         return None
 
-# === Candidates & filters (ranking) ===
-def score_image_url(u,vendor=""):
-    d=domain(u or ""); s=0
-    if any(wh in d for wh in BRAND_DOMAINS_WHITELIST if wh): s-=8
-    if any(wh in d for wh in TRUSTED_RETAILER_DOMAINS if wh): s-=5
-    if vendor and _brand_domain_like(vendor, d): s-=3
-    if any(h in d for h in SAFE_DOMAINS_HINTS): s-=1
-    if any(k in (u or "").lower() for k in WHITE_BG_KEYWORDS): s-=1
-    if any(b in d for b in DOMAINS_BLACKLIST): s+=10
-    return s
-
-def _is_lifestyle_url_or_ctx(url, ctx):
-    u=(url or "").lower(); c=(ctx or "").lower()
-    if any(w in u for w in LIFESTYLE_HINT_WORDS): return True
-    if any(w in c for w in LIFESTYLE_HINT_WORDS): return True
-    return False
-
-def _has_negative_keywords(url, ctx):
-    u=(url or "").lower(); c=(ctx or "").lower()
-    return any(k in u for k in NEGATIVE_KEYWORDS_IMG) or any(k in c for k in NEGATIVE_KEYWORDS_IMG)
+def _to_jpeg_bytes(img_pil, quality=90, background_white_if_alpha=True):
+    from io import BytesIO
+    img = img_pil
+    if img.mode in ("RGBA","LA") and background_white_if_alpha:
+        from PIL import Image
+        bg = Image.new("RGB", img.size, (255,255,255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    buf=BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
 # === Confidence models ===
 def _desc_confidence(vendor, code, info, page_domain, page_text):
@@ -589,6 +623,16 @@ def collect_candidate_images(queries, vendor="", code=""):
     items.sort(key=lambda it: score_image_url(it["content"], vendor))
     return items
 
+def score_image_url(u,vendor=""):
+    d=domain(u or ""); s=0
+    if any(wh in d for wh in BRAND_DOMAINS_WHITELIST if wh): s-=8
+    if any(wh in d for wh in TRUSTED_RETAILER_DOMAINS if wh): s-=5
+    if vendor and _brand_domain_like(vendor, d): s-=3
+    if any(h in d for h in SAFE_DOMAINS_HINTS): s-=1
+    if any(k in (u or "").lower() for k in WHITE_BG_KEYWORDS): s-=1
+    if any(b in d for b in DOMAINS_BLACKLIST): s+=10
+    return s
+
 # === ITALIAN normalization ===
 IT_COLOR_MAP = {
     "white":"bianco","off white":"bianco","antique white":"bianco antico","black":"nero","navy":"blu navy","blue":"blu",
@@ -611,166 +655,133 @@ def _to_italian_material(s:str)->str:
         if k in low: return re.sub(re.escape(k), v, low).strip()
     return s
 
-def filter_and_select_images(candidates, vendor="", title="", code="", color_pref="", want_n=5):
-    from PIL import Image
-    selected=[]; seen_hash=[]
-    for it in candidates:
-        if len(selected)>=want_n: break
-        url=it["content"]; ctx=it.get("context") or url
+# === GALLERY MODE (single-source per prodotto) ===
+def _absolute_urls(base_url, urls):
+    out=[]
+    for u in urls:
+        try:
+            if not u: continue
+            if u.startswith("//"):
+                u = "https:" + u
+            elif not re.match(r"^https?://", u, re.I):
+                u = urljoin(base_url, u)
+            out.append(u)
+        except Exception:
+            continue
+    return out
 
-        if _has_negative_keywords(url, ctx): continue
-        if REJECT_LIFESTYLE_HINTS and _is_lifestyle_url_or_ctx(url, ctx): continue
+def _collect_gallery_from_context(ctx_url, page_text=None):
+    """Estrae tutte le immagini della pagina prodotto (img, srcset, ld+json, og:image)."""
+    text = page_text or _http_get_text(ctx_url, limit_bytes=CONTEXT_FETCH_MAX)
+    info = _extract_product_structured(text) if text else {}
+    imgs = []
+    imgs += info.get("og_images",[]) or []
+    imgs += info.get("page_images",[]) or []
+    imgs = _absolute_urls(ctx_url, imgs)
+    # Dedup e ordina favorendo immagini grandi (euristiche su nome)
+    uniq=[]; seen=set()
+    for u in imgs:
+        if any(blk in u.lower() for blk in ["sprite","icon","logo","placeholder","thumb"]): continue
+        if u in seen: continue
+        seen.add(u); uniq.append(u)
+    return uniq, info, text
+
+def _process_gallery_to_attachments(gallery_urls, vendor, code, page_text, info, color_pref, want_n):
+    """Scarica, applica filtri, rimuove sfondo se necessario, taglia volti; restituisce lista di (bytes, ext='jpg')."""
+    from PIL import Image
+    out=[]; seen_hash=[]
+    for url in gallery_urls:
+        if len(out)>=want_n: break
+        d=domain(url)
+        # filtri di base per URL
+        if any(bad in d for bad in DOMAINS_BLACKLIST): continue
+        if _is_lifestyle_url_or_ctx(url, page_text):  # usa testo pagina per lifestyle hints
+            if REJECT_LIFESTYLE_HINTS: continue
+        if _has_negative_keywords(url, page_text): continue
 
         data=_download_bytes(url)
         if not data: continue
 
-        page_txt = _http_get_text(ctx, limit_bytes=CONTEXT_FETCH_MAX) if ctx else ""
-        info = _extract_product_structured(page_txt) if page_txt else {}
+        # confidenza sul contesto (usa stesso info/page_text per tutta la pagina)
+        conf = _img_confidence(vendor, code, url, ctx=url, page_text=page_text, info=info)
+        if conf < IMG_CONFIDENCE_THRESHOLD: 
+            continue
 
-        # colore deve comparire (se richiesto)
-        if REQUIRE_COLOR_MATCH_IMG and color_pref:
-            cp=color_pref.lower()
-            c_ok = (cp in (url or "").lower()) \
-                   or (cp in (ctx or "").lower()) \
-                   or (cp in (safe_strip(info.get("color") or "").lower())) \
-                   or (cp in (safe_strip(safe_get(info,"specs","color_hint") or "").lower())) \
-                   or (cp in (page_txt or "").lower())
-            if not c_ok: continue
-
-        conf = _img_confidence(vendor, code, url, ctx, page_txt, info)
-        if conf < IMG_CONFIDENCE_THRESHOLD: continue
-
+        # apri immagine e controlli
         try:
             from io import BytesIO
             img=Image.open(BytesIO(data))
             w,h=img.size
             if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: continue
-            # No volti
-            if _has_faces(img):
-                if DEBUG: print("  - Scartata per volti rilevati")
-                continue
 
+            # match colore
+            if REQUIRE_COLOR_MATCH_IMG and color_pref:
+                cp=color_pref.lower()
+                in_meta = cp in (safe_strip(info.get("color") or "").lower()) \
+                          or cp in (safe_strip(safe_get(info,"specs","color_hint") or "").lower()) \
+                          or cp in (page_text or "").lower()
+                in_url = cp in (url or "").lower()
+                if not (in_meta or in_url):
+                    continue
+
+            # volti -> prova crop testa
+            need_crop = _has_faces(img)
+            if need_crop:
+                img2, cropped = _crop_head_if_present(img)
+                # ricontrolla volti
+                if _has_faces(img2):
+                    # se rimangono volti, scarta
+                    if DEBUG: print("  - Scartata: volti dopo crop")
+                    continue
+                img = img2
+
+            # sfondo & rembg
             bg_white = _is_white_bg(img)
             bg_plain = _is_plain_colored_bg(img) if ALLOW_COLORED_BG else False
-
-            plan = None
-            out_bytes = None
-            if bg_white:
-                plan = ("src", url)  # ok così com'è
-            elif bg_plain and ENABLE_BG_REMOVAL:
-                out_bytes = _remove_bg(data)
-                if out_bytes:
-                    plan = ("attachment", out_bytes)
-                else:
-                    if ENFORCE_BG_REMOVAL:
+            final_img = img
+            if not bg_white:
+                if bg_plain and ENABLE_BG_REMOVAL:
+                    # rimuovi sfondo -> converti su bianco e jpg
+                    out_png = _remove_bg(data)
+                    if out_png:
+                        final_img = Image.open(BytesIO(out_png))
+                    elif ENFORCE_BG_REMOVAL:
                         continue
-                    plan = ("src", url) if ACCEPT_COLORED_IF_REMOVE_FAIL else None
-            elif bg_plain and not ENABLE_BG_REMOVAL:
-                plan = ("src", url) if ACCEPT_COLORED_IF_REMOVE_FAIL else None
-            else:
-                # sfondo complesso: prova comunque a rimuovere se abilitato
-                if ENABLE_BG_REMOVAL:
-                    out_bytes = _remove_bg(data)
-                    if out_bytes:
-                        plan = ("attachment", out_bytes)
-                    else:
-                        if ENFORCE_BG_REMOVAL:
-                            continue
-                        plan = None
-                else:
-                    plan = None
+                elif not bg_plain and ENABLE_BG_REMOVAL:
+                    out_png = _remove_bg(data)
+                    if out_png:
+                        final_img = Image.open(BytesIO(out_png))
+                    elif ENFORCE_BG_REMOVAL:
+                        continue
+                elif not (bg_plain and ACCEPT_COLORED_IF_REMOVE_FAIL):
+                    # sfondo complesso e non possiamo rimuovere
+                    continue
 
-            if not plan: continue
-
-            # hash per dedup (su immagine "finale" se disponibile)
+            # dedup percettivo
             try:
-                if plan[0]=="attachment":
-                    img2=Image.open(BytesIO(plan[1]))
-                else:
-                    img2=img
-                hcode=_ahash(img2)
+                hcode=_ahash(final_img)
+                if any(_hamming(hcode, prev)<=5 for prev in seen_hash): 
+                    continue
+                seen_hash.append(hcode)
             except Exception:
-                hcode=_ahash(img)
-            if any(_hamming(hcode, prev)<=5 for prev in seen_hash): continue
-            seen_hash.append(hcode)
+                pass
 
-            selected.append({"plan":plan, "url":url, "conf":conf})
+            # sempre JPEG con sfondo bianco (anche se PNG con alpha)
+            jpg_bytes = _to_jpeg_bytes(final_img, quality=90, background_white_if_alpha=True)
+            out.append(jpg_bytes)
         except Exception:
             continue
+    return out
 
-    # Ordina per confidenza
-    selected.sort(key=lambda t: t["conf"], reverse=True)
-    return selected
+def _is_lifestyle_url_or_ctx(url, ctx_text_or_url):
+    u=(url or "").lower(); c=(ctx_text_or_url or "").lower()
+    if any(w in u for w in LIFESTYLE_HINT_WORDS): return True
+    if any(w in c for w in LIFESTYLE_HINT_WORDS): return True
+    return False
 
-# === Descrizioni (Shopify Magic style) — ITA ===
-def magic_prompt_for_sku(sku: str) -> str:
-    sku = safe_strip(sku) or "N/D"
-    return f"descrivi prodotto {sku} in italiano, con prima parte emozionale e seconda parte Bullet Point"
-
-def build_magic_style_description(title, vendor, ptype, code, info, color_override=""):
-    title_src = safe_strip(info.get("title")) or title
-    brand_src = safe_strip(info.get("brand")) or vendor
-    color_raw = color_override or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
-    material_raw = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
-    color     = _to_italian_color(color_raw)
-    material  = _to_italian_material(material_raw)
-    sleeve    = safe_strip(safe_get(info,"specs","sleeve_hint") or "")
-
-    name_bits = []
-    if ptype: name_bits.append(ptype)
-    if title_src and (not ptype or title_src.lower() not in (ptype or "").lower()):
-        name_bits.append(title_src)
-    display_name = " ".join(name_bits) or (title or "Capo")
-
-    emo = f"Indossa {html.escape(display_name)}"
-    if brand_src: emo += f" di {html.escape(brand_src)}"
-    emo += " e scopri un equilibrio perfetto tra stile e comfort quotidiano."
-    if color: emo += f" La tonalità {html.escape(color)} valorizza il tuo look."
-    if material: emo += f" La composizione selezionata garantisce una mano piacevole e durata nel tempo."
-    if sleeve: emo += f" Dettagli come {html.escape(sleeve)} completano l’insieme."
-    emo_par = f"<p>{emo}</p>"
-
-    bullets=[]
-    if color: bullets.append(f"Colore: {html.escape(color)}")
-    if material:
-        material_clean = re.sub(r"100\s*%\s*([a-z]+)", lambda m: "100% "+_to_italian_material(m.group(1)), material, flags=re.I)
-        bullets.append(f"Composizione: {html.escape(material_clean)}")
-    bullets += [
-        "Vestibilità confortevole e facile da abbinare",
-        "Dettagli essenziali e finiture curate",
-        "Ideale dal lavoro al tempo libero",
-        "Cura: seguire le istruzioni in etichetta"
-    ]
-    if code: bullets.append(f"Codice articolo: {html.escape(code)}")
-    ul="<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:6]) + "</ul>"
-    return emo_par + ul
-
-def gen_description_from_sources_magic_format(title, vendor, ptype, code, color_pref=""):
-    queries=[f"\"{code}\"", f"{vendor} {code}", f"{title} {code}"]
-    best=None
-    for q in queries:
-        items=google_cse_web_search(q, num=8)
-        for it in items:
-            link=it.get("link"); d=domain(link)
-            if not link: continue
-            if any(b in d for b in DOMAINS_BLACKLIST): continue
-            txt=_http_get_text(link, limit_bytes=CONTEXT_FETCH_MAX)
-            if not txt: continue
-            info=_extract_product_structured(txt)
-            conf=_desc_confidence(vendor, code, info, d, txt)
-            fields = 0
-            if color_pref or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or ""): fields += 1
-            if safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or ""): fields += 1
-            if conf>=DESC_CONFIDENCE_THRESHOLD and fields>=MIN_FIELDS_FOR_DESC:
-                best=(link, info, conf); break
-        if best: break
-    if best:
-        link, info, conf = best
-        desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
-        return desc_html, link, conf
-    info={}
-    desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
-    return desc_html, None, 0.0
+def _has_negative_keywords(url, ctx_text_or_url):
+    u=(url or "").lower(); c=(ctx_text_or_url or "").lower()
+    return any(k in u for k in NEGATIVE_KEYWORDS_IMG) or any(k in c for k in NEGATIVE_KEYWORDS_IMG)
 
 # === Shopify color extraction ===
 def extract_shopify_color(product_node: dict) -> str:
@@ -909,49 +920,67 @@ def main():
             else:
                 print(f"  - Descrizione NON aggiornata (conf={desc_conf:.2f} < {DESC_CONFIDENCE_THRESHOLD} o info minime assenti)")
 
-            # ----- IMMAGINI
-            uploaded=0; uploaded_refs=[]
-            selected=[]
+            # ----- IMMAGINI (GALLERY SINGLE-SOURCE)
+            uploaded=0; uploaded_refs=[]; gallery_source_url=None
+
             if BING_IMAGE_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
                 q_img=[]
                 if code_for_search:
-                    base_bits = [bit for bit in [vendor, title] if bit]
-                    base = " ".join(base_bits).strip()
                     if color_pref:
                         q_img += [
                             f"\"{code_for_search}\" \"{color_pref}\" packshot",
                             f"{vendor} {code_for_search} \"{color_pref}\" studio",
                             f"{title} {code_for_search} \"{color_pref}\" background",
                         ]
-                    # site: brand/retailer (sempre)
                     q_img += [f"site:{d} {code_for_search} {color_pref}".strip() for d in (BRAND_DOMAINS_WHITELIST+TRUSTED_RETAILER_DOMAINS)]
-                    if not DISABLE_GENERIC_IMAGE_QUERIES:
-                        q_img += [f"{base} packshot", f"{base} studio background"]
-                cands = collect_candidate_images(q_img, vendor=vendor, code=code_for_search)
-                selected = filter_and_select_images(cands, vendor=vendor, title=title, code=code_for_search, color_pref=color_pref, want_n=MAX_IMAGES_PER_PRODUCT)
+                candidates = collect_candidate_images(q_img, vendor=vendor, code=code_for_search)
 
-            if selected:
-                for item in selected:
-                    plan = item["plan"]; alt=f"{vendor} {title}".strip()
-                    try:
-                        if plan[0]=="attachment":
-                            img_id=add_image_attachment(pid, plan[1], filename=f"{pid}_{int(datetime.now().timestamp())}.png", alt_text=alt)
-                            uploaded_refs.append("attachment:bg-removed")
-                        else:
-                            img_id=add_image(pid, plan[1], alt_text=alt)
-                            uploaded_refs.append(plan[1])
-                        uploaded+=1
-                        print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅ [{plan[0]}]")
-                    except Exception as ex:
-                        print(f"  - ERRORE immagine: {ex}")
-                print(f"  - Immagini caricate: {uploaded} ✅")
-            else:
-                print("  - Nessuna immagine idonea (sfondo/volti/brand/codice/colore).")
+                # scegli la PRIMA candidata che supera confidenza e da dominio affidabile; poi usa SOLO quella pagina
+                best_ctx=None; best_info=None; best_text=None
+                for it in candidates:
+                    url=it["content"]; ctx=it.get("context") or url
+                    page_txt = _http_get_text(ctx, limit_bytes=CONTEXT_FETCH_MAX)
+                    if not page_txt: continue
+                    info = _extract_product_structured(page_txt)
+                    conf = _img_confidence(vendor, code_for_search, url, ctx, page_txt, info)
+                    d = domain(ctx or url)
+                    trusted = (any(w in d for w in BRAND_DOMAINS_WHITELIST) or any(w in d for w in TRUSTED_RETAILER_DOMAINS))
+                    if conf>=IMG_CONFIDENCE_THRESHOLD and trusted:
+                        best_ctx=ctx; best_info=info; best_text=page_txt
+                        break
 
-            if desc_updated or uploaded>0:
+                if best_ctx:
+                    gallery_urls, info_full, page_text = _collect_gallery_from_context(best_ctx, page_text=best_text)
+                    # usa info più ricco
+                    if info_full: best_info = info_full
+                    # filtra galleria: stesso dominio della pagina
+                    base_dom = domain(best_ctx)
+                    gallery_urls = [u for u in gallery_urls if domain(u)==base_dom]
+                    # processa a attachments (JPEG) con crop volti / rembg / dedup
+                    attachments = _process_gallery_to_attachments(
+                        gallery_urls, vendor, code_for_search, page_text, best_info, color_pref, want_n=MAX_IMAGES_PER_PRODUCT
+                    )
+                    # upload come attachment rinominando SKU_#.jpg
+                    idx=1
+                    for img_bytes in attachments:
+                        fn = f"{chosen_sku}_{idx}.jpg" if chosen_sku else f"{pid}_{idx}.jpg"
+                        try:
+                            img_id=add_image_attachment(pid, img_bytes, filename=fn, alt_text=f"{vendor} {title}".strip())
+                            uploaded+=1; idx+=1
+                            uploaded_refs.append(fn)
+                            print(f"  - Immagine aggiunta (#{uploaded}) id={img_id} ✅ [attachment:{fn}]")
+                        except Exception as ex:
+                            print(f"  - ERRORE immagine: {ex}")
+                    if uploaded>0:
+                        gallery_source_url = best_ctx
+                        print(f"  - Immagini caricate dalla stessa pagina: {base_dom} ✅")
+                else:
+                    print("  - Nessuna pagina affidabile per galleria immagini trovata.")
+
+            if uploaded>0:
                 print(f"  Admin: {ADMIN_URL.format(pid=pid)}")
 
-            results.append(row(pid,title,vendor,code_for_search,uploaded,desc_updated,"",used_context_url," | ".join(uploaded_refs)))
+            results.append(row(pid,title,vendor,code_for_search,uploaded,desc_updated,"",gallery_source_url or used_context_url," | ".join(uploaded_refs)))
             if desc_updated or uploaded>0: processed+=1
             else: skipped+=1
 
@@ -962,6 +991,76 @@ def main():
                                vendor if 'vendor' in locals() else "", "", 0, False, f"errore prodotto: {ex}"))
 
     report_and_exit(results, scanned, processed, skipped)
+
+# === Descrizioni (Shopify Magic style) — ITA (rimangono invariate) ===
+def magic_prompt_for_sku(sku: str) -> str:
+    sku = safe_strip(sku) or "N/D"
+    return f"descrivi prodotto {sku} in italiano, con prima parte emozionale e seconda parte Bullet Point"
+
+def build_magic_style_description(title, vendor, ptype, code, info, color_override=""):
+    title_src = safe_strip(info.get("title")) or title
+    brand_src = safe_strip(info.get("brand")) or vendor
+    color_raw = color_override or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
+    material_raw = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
+    color     = _to_italian_color(color_raw)
+    material  = _to_italian_material(material_raw)
+    sleeve    = safe_strip(safe_get(info,"specs","sleeve_hint") or "")
+
+    name_bits = []
+    if ptype: name_bits.append(ptype)
+    if title_src and (not ptype or title_src.lower() not in (ptype or "").lower()):
+        name_bits.append(title_src)
+    display_name = " ".join(name_bits) or (title or "Capo")
+
+    emo = f"Indossa {html.escape(display_name)}"
+    if brand_src: emo += f" di {html.escape(brand_src)}"
+    emo += " e scopri un equilibrio perfetto tra stile e comfort quotidiano."
+    if color: emo += f" La tonalità {html.escape(color)} valorizza il tuo look."
+    if material: emo += f" La composizione selezionata garantisce una mano piacevole e durata nel tempo."
+    if sleeve: emo += f" Dettagli come {html.escape(sleeve)} completano l’insieme."
+    emo_par = f"<p>{emo}</p>"
+
+    bullets=[]
+    if color: bullets.append(f"Colore: {html.escape(color)}")
+    if material:
+        material_clean = re.sub(r"100\s*%\s*([a-z]+)", lambda m: "100% "+_to_italian_material(m.group(1)), material, flags=re.I)
+        bullets.append(f"Composizione: {html.escape(material_clean)}")
+    bullets += [
+        "Vestibilità confortevole e facile da abbinare",
+        "Dettagli essenziali e finiture curate",
+        "Ideale dal lavoro al tempo libero",
+        "Cura: seguire le istruzioni in etichetta"
+    ]
+    if code: bullets.append(f"Codice articolo: {html.escape(code)}")
+    ul="<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:6]) + "</ul>"
+    return emo_par + ul
+
+def gen_description_from_sources_magic_format(title, vendor, ptype, code, color_pref=""):
+    queries=[f"\"{code}\"", f"{vendor} {code}", f"{title} {code}"]
+    best=None
+    for q in queries:
+        items=google_cse_web_search(q, num=8)
+        for it in items:
+            link=it.get("link"); d=domain(link)
+            if not link: continue
+            if any(b in d for b in DOMAINS_BLACKLIST): continue
+            txt=_http_get_text(link, limit_bytes=CONTEXT_FETCH_MAX)
+            if not txt: continue
+            info=_extract_product_structured(txt)
+            conf=_desc_confidence(vendor, code, info, d, txt)
+            fields = 0
+            if color_pref or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or ""): fields += 1
+            if safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or ""): fields += 1
+            if conf>=DESC_CONFIDENCE_THRESHOLD and fields>=MIN_FIELDS_FOR_DESC:
+                best=(link, info, conf); break
+        if best: break
+    if best:
+        link, info, conf = best
+        desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
+        return desc_html, link, conf
+    info={}
+    desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
+    return desc_html, None, 0.0
 
 if __name__ == "__main__":
     try:
