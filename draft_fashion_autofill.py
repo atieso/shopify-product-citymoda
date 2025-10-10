@@ -5,7 +5,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-VERSION = "2025-09-24-magic+imgs-v7-gallery-single-source+face-crop+rename-jpg"
+VERSION = "2025-10-10-v8-gallery-single-source+face-crop+rename-jpg+desc-structure"
 load_dotenv()
 
 # ========= CONFIG =========
@@ -453,18 +453,14 @@ def _extract_product_structured(text):
             if "colore" in t or "color" in t: specs["color_hint"]=t
             if "maniche" in t or "sleeve" in t: specs["sleeve_hint"]=t
         info["specs"]=specs
-        # prova anche og:image e gallerie comuni
         og_imgs=[m.get("content") for m in soup.find_all("meta",{"property":"og:image"}) if m.get("content")]
         info["og_images"]=og_imgs
-        # immagini nella pagina
         page_imgs=[]
         for tag in soup.find_all(["img","source"]):
             for attr in ["src","data-src","data-original","data-zoom-image","data-large_image","srcset","data-srcset"]:
                 val=tag.get(attr)
                 if not val: continue
-                # srcset => prendi url principale
                 if " " in val and "," in val:
-                    # prendi i candidati, scegli quello con densità più alta
                     pairs=[p.strip() for p in val.split(",") if p.strip()]
                     if pairs:
                         best=pairs[-1].split(" ")[0]
@@ -510,10 +506,9 @@ def _ensure_face_cascade():
     return True
 
 def _detect_faces_np(img_pil):
-    """Ritorna lista di (x,y,w,h) in coordinate immagine."""
     if not ENFORCE_FACE_DETECTION: return []
     ok = _ensure_face_cascade()
-    if not ok: return [(-1,-1,-1,-1)]  # impedisce uso se non possiamo verificare
+    if not ok: return [(-1,-1,-1,-1)]
     try:
         import numpy as np
         rgb = np.array(img_pil.convert("RGB"))
@@ -531,16 +526,13 @@ def _has_faces(img_pil):
     return len(faces) > MAX_FACES_ALLOWED
 
 def _crop_head_if_present(img_pil):
-    """Se trova volti, taglia la parte alta sopra ~0.6 dell'altezza del volto superiore."""
     faces=_detect_faces_np(img_pil)
     if not faces or faces==[(-1,-1,-1,-1)]: 
         return img_pil, (faces!=[] and faces!=[(-1,-1,-1,-1)])
-    # trova il volto più alto (min y)
     top_face=min(faces, key=lambda f:f[1])
     x,y,w,h = top_face
     W,H=img_pil.size
     crop_top = max(0, int(y + 0.6*h))
-    # non tagliare troppo (almeno 60% altezza residua)
     min_remain = int(0.6*H)
     if (H - crop_top) < min_remain:
         crop_top = max(0, H - min_remain)
@@ -552,7 +544,7 @@ def _remove_bg(image_bytes: bytes) -> bytes or None:
     if not ENABLE_BG_REMOVAL: return None
     try:
         from rembg import remove
-        out = remove(image_bytes)  # PNG con alpha
+        out = remove(image_bytes)
         return out
     except Exception as e:
         if DEBUG: print(f"[BG] Rimozione sfondo non disponibile/errore: {e}")
@@ -569,7 +561,7 @@ def _to_jpeg_bytes(img_pil, quality=90, background_white_if_alpha=True):
     elif img.mode != "RGB":
         img = img.convert("RGB")
     buf=BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    img.save(buf, format="JPEG", quality=90, optimize=True)
     return buf.getvalue()
 
 # === Confidence models ===
@@ -671,14 +663,12 @@ def _absolute_urls(base_url, urls):
     return out
 
 def _collect_gallery_from_context(ctx_url, page_text=None):
-    """Estrae tutte le immagini della pagina prodotto (img, srcset, ld+json, og:image)."""
     text = page_text or _http_get_text(ctx_url, limit_bytes=CONTEXT_FETCH_MAX)
     info = _extract_product_structured(text) if text else {}
     imgs = []
     imgs += info.get("og_images",[]) or []
     imgs += info.get("page_images",[]) or []
     imgs = _absolute_urls(ctx_url, imgs)
-    # Dedup e ordina favorendo immagini grandi (euristiche su nome)
     uniq=[]; seen=set()
     for u in imgs:
         if any(blk in u.lower() for blk in ["sprite","icon","logo","placeholder","thumb"]): continue
@@ -687,34 +677,29 @@ def _collect_gallery_from_context(ctx_url, page_text=None):
     return uniq, info, text
 
 def _process_gallery_to_attachments(gallery_urls, vendor, code, page_text, info, color_pref, want_n):
-    """Scarica, applica filtri, rimuove sfondo se necessario, taglia volti; restituisce lista di (bytes, ext='jpg')."""
     from PIL import Image
     out=[]; seen_hash=[]
     for url in gallery_urls:
         if len(out)>=want_n: break
         d=domain(url)
-        # filtri di base per URL
         if any(bad in d for bad in DOMAINS_BLACKLIST): continue
-        if _is_lifestyle_url_or_ctx(url, page_text):  # usa testo pagina per lifestyle hints
+        if _is_lifestyle_url_or_ctx(url, page_text):
             if REJECT_LIFESTYLE_HINTS: continue
         if _has_negative_keywords(url, page_text): continue
 
         data=_download_bytes(url)
         if not data: continue
 
-        # confidenza sul contesto (usa stesso info/page_text per tutta la pagina)
         conf = _img_confidence(vendor, code, url, ctx=url, page_text=page_text, info=info)
         if conf < IMG_CONFIDENCE_THRESHOLD: 
             continue
 
-        # apri immagine e controlli
         try:
             from io import BytesIO
             img=Image.open(BytesIO(data))
             w,h=img.size
             if w<IMAGE_MIN_SIDE or h<IMAGE_MIN_SIDE: continue
 
-            # match colore
             if REQUIRE_COLOR_MATCH_IMG and color_pref:
                 cp=color_pref.lower()
                 in_meta = cp in (safe_strip(info.get("color") or "").lower()) \
@@ -724,24 +709,19 @@ def _process_gallery_to_attachments(gallery_urls, vendor, code, page_text, info,
                 if not (in_meta or in_url):
                     continue
 
-            # volti -> prova crop testa
             need_crop = _has_faces(img)
             if need_crop:
-                img2, cropped = _crop_head_if_present(img)
-                # ricontrolla volti
+                img2, _ = _crop_head_if_present(img)
                 if _has_faces(img2):
-                    # se rimangono volti, scarta
                     if DEBUG: print("  - Scartata: volti dopo crop")
                     continue
                 img = img2
 
-            # sfondo & rembg
             bg_white = _is_white_bg(img)
             bg_plain = _is_plain_colored_bg(img) if ALLOW_COLORED_BG else False
             final_img = img
             if not bg_white:
                 if bg_plain and ENABLE_BG_REMOVAL:
-                    # rimuovi sfondo -> converti su bianco e jpg
                     out_png = _remove_bg(data)
                     if out_png:
                         final_img = Image.open(BytesIO(out_png))
@@ -754,10 +734,8 @@ def _process_gallery_to_attachments(gallery_urls, vendor, code, page_text, info,
                     elif ENFORCE_BG_REMOVAL:
                         continue
                 elif not (bg_plain and ACCEPT_COLORED_IF_REMOVE_FAIL):
-                    # sfondo complesso e non possiamo rimuovere
                     continue
 
-            # dedup percettivo
             try:
                 hcode=_ahash(final_img)
                 if any(_hamming(hcode, prev)<=5 for prev in seen_hash): 
@@ -766,7 +744,6 @@ def _process_gallery_to_attachments(gallery_urls, vendor, code, page_text, info,
             except Exception:
                 pass
 
-            # sempre JPEG con sfondo bianco (anche se PNG con alpha)
             jpg_bytes = _to_jpeg_bytes(final_img, quality=90, background_white_if_alpha=True)
             out.append(jpg_bytes)
         except Exception:
@@ -829,6 +806,109 @@ def report_and_exit(results, scanned, processed, skipped):
     except Exception as e:
         print(f"[REPORT ERROR] {e}")
     print(f"[SUMMARY] Scanned: {scanned} | Updated: {processed} | Skipped: {skipped}")
+
+# === DESCRIZIONI (nuova struttura) ===
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _strip_brand_and_color_from_title(title: str, vendor: str, color: str) -> str:
+    t = " " + (title or "") + " "
+    if vendor:
+        t = re.sub(rf"(?i)\b{re.escape(vendor)}\b", " ", t, flags=re.I)
+    colors = [
+        color,
+        "bianco","nero","blu","rosso","verde","giallo","beige","grigio","marrone","rosa","navy",
+        "white","black","blue","red","green","yellow","beige","grey","gray","brown","pink"
+    ]
+    for c in set([_clean_spaces(color or "").lower()] + colors):
+        if not c: continue
+        t = re.sub(rf"(?i)(^|\W){re.escape(c)}(\W|$)", " ", t, flags=re.I)
+    t = re.sub(r"[\s\-–—|]+$", "", _clean_spaces(t))
+    return t
+
+def build_magic_style_description(title, vendor, ptype, code, info, color_override=""):
+    """
+    STRUTTURA RICHIESTA:
+    1) Prima frase: solo modello + colore.
+    2) Frase emozionale concisa (stile, comfort, contesto d’uso).
+    3) Elenco puntato con caratteristiche principali.
+    4) Composizione alla fine.
+    """
+    title_src   = safe_strip(info.get("title")) or safe_strip(title)
+    brand_src   = safe_strip(info.get("brand")) or safe_strip(vendor)
+    color_raw   = color_override or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
+    material_raw= safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
+
+    color     = _clean_spaces(_to_italian_color(color_raw))
+    material  = _clean_spaces(_to_italian_material(material_raw))
+
+    model_name = _strip_brand_and_color_from_title(title_src, brand_src, color)
+    if not model_name:
+        model_name = title_src or "Modello"
+
+    first_sentence = f"{model_name} {color}".strip() if color else model_name
+    first_sentence = _clean_spaces(first_sentence).rstrip(".") + "."
+
+    emo_bits = []
+    if brand_src:
+        emo_bits.append(f"Stile {brand_src} senza eccessi")
+    else:
+        emo_bits.append("Stile essenziale")
+    emo_bits.append("comfort quotidiano")
+    emo_bits.append("perfetto dal tempo libero all’ufficio")
+    intro_sentence = " • ".join(emo_bits)
+    intro_sentence = intro_sentence[0].upper()+intro_sentence[1:]
+    intro_par = f"<p>{intro_sentence}.</p>"
+
+    bullets = []
+    sleeve_hint   = safe_strip(safe_get(info,"specs","sleeve_hint") or "")
+    if sleeve_hint:
+        bullets.append(f"Dettagli: {html.escape(sleeve_hint)}")
+    bullets.append("Design pulito e facile da abbinare")
+    bullets.append("Vestibilità equilibrata, pensata per l’uso quotidiano")
+    bullets.append("Finiture curate e materiali selezionati")
+    if code:
+        bullets.append(f"Codice articolo: {html.escape(code)}")
+    ul_html = "<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
+
+    comp_line = ""
+    if material:
+        material_clean = re.sub(r"100\s*%\s*([a-zà-ù]+)", lambda m: "100% "+_to_italian_material(m.group(1)), material, flags=re.I)
+        comp_line = f"<p><strong>Composizione:</strong> {html.escape(material_clean)}</p>"
+
+    html_out = f"<p>{html.escape(first_sentence)}</p>" + intro_par + ul_html + comp_line
+    return html_out
+
+def magic_prompt_for_sku(sku: str) -> str:
+    sku = safe_strip(sku) or "N/D"
+    return f"descrivi prodotto {sku} in italiano, con prima frase solo modello+colore, poi frase emozionale concisa su stile/comfort/uso, poi bullet caratteristiche principali, e composizione alla fine"
+
+def gen_description_from_sources_magic_format(title, vendor, ptype, code, color_pref=""):
+    queries=[f"\"{code}\"", f"{vendor} {code}", f"{title} {code}"]
+    best=None
+    for q in queries:
+        items=google_cse_web_search(q, num=8)
+        for it in items:
+            link=it.get("link"); d=domain(link)
+            if not link: continue
+            if any(b in d for b in DOMAINS_BLACKLIST): continue
+            txt=_http_get_text(link, limit_bytes=CONTEXT_FETCH_MAX)
+            if not txt: continue
+            info=_extract_product_structured(txt)
+            conf=_desc_confidence(vendor, code, info, d, txt)
+            fields = 0
+            if color_pref or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or ""): fields += 1
+            if safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or ""): fields += 1
+            if conf>=DESC_CONFIDENCE_THRESHOLD and fields>=MIN_FIELDS_FOR_DESC:
+                best=(link, info, conf); break
+        if best: break
+    if best:
+        link, info, conf = best
+        desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
+        return desc_html, link, conf
+    info={}
+    desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
+    return desc_html, None, 0.0
 
 # === MAIN ===
 def main():
@@ -935,7 +1015,6 @@ def main():
                     q_img += [f"site:{d} {code_for_search} {color_pref}".strip() for d in (BRAND_DOMAINS_WHITELIST+TRUSTED_RETAILER_DOMAINS)]
                 candidates = collect_candidate_images(q_img, vendor=vendor, code=code_for_search)
 
-                # scegli la PRIMA candidata che supera confidenza e da dominio affidabile; poi usa SOLO quella pagina
                 best_ctx=None; best_info=None; best_text=None
                 for it in candidates:
                     url=it["content"]; ctx=it.get("context") or url
@@ -951,16 +1030,12 @@ def main():
 
                 if best_ctx:
                     gallery_urls, info_full, page_text = _collect_gallery_from_context(best_ctx, page_text=best_text)
-                    # usa info più ricco
                     if info_full: best_info = info_full
-                    # filtra galleria: stesso dominio della pagina
                     base_dom = domain(best_ctx)
                     gallery_urls = [u for u in gallery_urls if domain(u)==base_dom]
-                    # processa a attachments (JPEG) con crop volti / rembg / dedup
                     attachments = _process_gallery_to_attachments(
                         gallery_urls, vendor, code_for_search, page_text, best_info, color_pref, want_n=MAX_IMAGES_PER_PRODUCT
                     )
-                    # upload come attachment rinominando SKU_#.jpg
                     idx=1
                     for img_bytes in attachments:
                         fn = f"{chosen_sku}_{idx}.jpg" if chosen_sku else f"{pid}_{idx}.jpg"
@@ -991,76 +1066,6 @@ def main():
                                vendor if 'vendor' in locals() else "", "", 0, False, f"errore prodotto: {ex}"))
 
     report_and_exit(results, scanned, processed, skipped)
-
-# === Descrizioni (Shopify Magic style) — ITA (rimangono invariate) ===
-def magic_prompt_for_sku(sku: str) -> str:
-    sku = safe_strip(sku) or "N/D"
-    return f"descrivi prodotto {sku} in italiano, con prima parte emozionale e seconda parte Bullet Point"
-
-def build_magic_style_description(title, vendor, ptype, code, info, color_override=""):
-    title_src = safe_strip(info.get("title")) or title
-    brand_src = safe_strip(info.get("brand")) or vendor
-    color_raw = color_override or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or "")
-    material_raw = safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or "")
-    color     = _to_italian_color(color_raw)
-    material  = _to_italian_material(material_raw)
-    sleeve    = safe_strip(safe_get(info,"specs","sleeve_hint") or "")
-
-    name_bits = []
-    if ptype: name_bits.append(ptype)
-    if title_src and (not ptype or title_src.lower() not in (ptype or "").lower()):
-        name_bits.append(title_src)
-    display_name = " ".join(name_bits) or (title or "Capo")
-
-    emo = f"Indossa {html.escape(display_name)}"
-    if brand_src: emo += f" di {html.escape(brand_src)}"
-    emo += " e scopri un equilibrio perfetto tra stile e comfort quotidiano."
-    if color: emo += f" La tonalità {html.escape(color)} valorizza il tuo look."
-    if material: emo += f" La composizione selezionata garantisce una mano piacevole e durata nel tempo."
-    if sleeve: emo += f" Dettagli come {html.escape(sleeve)} completano l’insieme."
-    emo_par = f"<p>{emo}</p>"
-
-    bullets=[]
-    if color: bullets.append(f"Colore: {html.escape(color)}")
-    if material:
-        material_clean = re.sub(r"100\s*%\s*([a-z]+)", lambda m: "100% "+_to_italian_material(m.group(1)), material, flags=re.I)
-        bullets.append(f"Composizione: {html.escape(material_clean)}")
-    bullets += [
-        "Vestibilità confortevole e facile da abbinare",
-        "Dettagli essenziali e finiture curate",
-        "Ideale dal lavoro al tempo libero",
-        "Cura: seguire le istruzioni in etichetta"
-    ]
-    if code: bullets.append(f"Codice articolo: {html.escape(code)}")
-    ul="<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:6]) + "</ul>"
-    return emo_par + ul
-
-def gen_description_from_sources_magic_format(title, vendor, ptype, code, color_pref=""):
-    queries=[f"\"{code}\"", f"{vendor} {code}", f"{title} {code}"]
-    best=None
-    for q in queries:
-        items=google_cse_web_search(q, num=8)
-        for it in items:
-            link=it.get("link"); d=domain(link)
-            if not link: continue
-            if any(b in d for b in DOMAINS_BLACKLIST): continue
-            txt=_http_get_text(link, limit_bytes=CONTEXT_FETCH_MAX)
-            if not txt: continue
-            info=_extract_product_structured(txt)
-            conf=_desc_confidence(vendor, code, info, d, txt)
-            fields = 0
-            if color_pref or safe_strip(info.get("color")) or safe_strip(safe_get(info,"specs","color_hint") or ""): fields += 1
-            if safe_strip(info.get("material")) or safe_strip(safe_get(info,"specs","material_hint") or ""): fields += 1
-            if conf>=DESC_CONFIDENCE_THRESHOLD and fields>=MIN_FIELDS_FOR_DESC:
-                best=(link, info, conf); break
-        if best: break
-    if best:
-        link, info, conf = best
-        desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
-        return desc_html, link, conf
-    info={}
-    desc_html = build_magic_style_description(title, vendor, ptype, code, info, color_override=color_pref)
-    return desc_html, None, 0.0
 
 if __name__ == "__main__":
     try:
